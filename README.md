@@ -170,3 +170,10 @@ quote 全部在标注页原文里逐字找到、页码全部落在抽取范围�
   说明校验闸门没被触发过，不说明抽取无错。
 - Word 目录是 TOC 域，需要在 Word/WPS 里"更新域"才出现页码。
 - 只跑过 41 页那份；96 页的 `tender_dxh.pdf` 未验证。
+- **200 页 / 26 章的规模测试用的是 Markdown 语料**（`docs/PERF.md`）：解析+切章 0.12–0.13 s、
+  PDF 口径 12.06 s 是分开测的，**「26 章 + 200 页 PDF」端到端没有直接实测**。要消掉这条限定
+  需引入一个 dev-only 的 PDF 生成依赖，未做。
+- **CI 三条红线（pytest / ruff / 引用可回查）已写进 `.github/workflows/ci.yml`，但当前 GitHub 上是红的**：
+  documind 是私有仓，actions 自带的 `GITHUB_TOKEN` 读不到它（`uv sync` 的 path 依赖需要兄弟目录）。
+  工作流已给出两条修法（配 `DOCUMIND_TOKEN` fine-grained token，或把 documind 设为 public）；
+  本地等价命令全绿，绿灯需要这个凭据决策。
