@@ -57,12 +57,25 @@ jobs:
         with:
           path: bidpilot
 
+      - name: 前置检查：documind 是私有仓，GITHUB_TOKEN 读不到
+        shell: bash
+        env:
+          DOCUMIND_TOKEN: ${{ secrets.DOCUMIND_TOKEN }}
+        run: |
+          if [ -z "$DOCUMIND_TOKEN" ]; then
+            echo "::error title=缺少 DOCUMIND_TOKEN::documind 是私有仓，actions' 自带的 GITHUB_TOKEN 只能读本仓，无法 checkout 它。"
+            echo "修法（约 2 分钟）：GitHub → Wind-fat/documind → Settings → Developer settings → 新建 fine-grained token（Contents: Read）→"
+            echo "  回到 bidpilot 仓 → Settings → Secrets and variables → Actions → New repository secret → 名字 DOCUMIND_TOKEN。"
+            echo "或者：把 documind 设为 public（本工作流自动用 github.token 即可，无需任何 secret）。"
+            exit 1
+          fi
+
       - name: Checkout documind（../documind，path 依赖的目标）
         uses: actions/checkout@v7
         with:
           repository: Wind-fat/documind
           path: documind
-          # 公开仓：github.token 够用。私有仓：在仓里配 DOCUMIND_TOKEN（contents:read）。
+          # 私有仓：必须配 DOCUMIND_TOKEN（contents:read）；上一步已给出可执行指引。
           token: ${{ secrets.DOCUMIND_TOKEN || github.token }}
           persist-credentials: false
 
@@ -93,6 +106,19 @@ jobs:
         uses: actions/checkout@v7
         with:
           path: bidpilot
+
+      - name: 前置检查：documind 是私有仓，GITHUB_TOKEN 读不到
+        shell: bash
+        env:
+          DOCUMIND_TOKEN: ${{ secrets.DOCUMIND_TOKEN }}
+        run: |
+          if [ -z "$DOCUMIND_TOKEN" ]; then
+            echo "::error title=缺少 DOCUMIND_TOKEN::documind 是私有仓，GITHUB_TOKEN 只能读本仓，uv sync 的 path 依赖会失败。"
+            echo "修法：Wind-fat/documind → Settings → Developer settings → fine-grained token（Contents: Read）→"
+            echo "      bidpilot → Settings → Secrets and variables → Actions → New repository secret → DOCUMIND_TOKEN。"
+            echo "或者：把 documind 设为 public（工作流转用 github.token，无需任何 secret）。"
+            exit 1
+          fi
 
       - name: Checkout documind（../documind）
         uses: actions/checkout@v7
@@ -127,6 +153,19 @@ jobs:
         uses: actions/checkout@v7
         with:
           path: bidpilot
+
+      - name: 前置检查：documind 是私有仓，GITHUB_TOKEN 读不到
+        shell: bash
+        env:
+          DOCUMIND_TOKEN: ${{ secrets.DOCUMIND_TOKEN }}
+        run: |
+          if [ -z "$DOCUMIND_TOKEN" ]; then
+            echo "::error title=缺少 DOCUMIND_TOKEN::documind 是私有仓，GITHUB_TOKEN 只能读本仓，uv sync 的 path 依赖会失败。"
+            echo "修法：Wind-fat/documind → Settings → Developer settings → fine-grained token（Contents: Read）→"
+            echo "      bidpilot → Settings → Secrets and variables → Actions → New repository secret → DOCUMIND_TOKEN。"
+            echo "或者：把 documind 设为 public（工作流转用 github.token，无需任何 secret）。"
+            exit 1
+          fi
 
       - name: Checkout documind（../documind）
         uses: actions/checkout@v7
