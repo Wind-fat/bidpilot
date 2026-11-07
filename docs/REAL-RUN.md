@@ -1,0 +1,43 @@
+# 真实 LLM 端到端一次跑（2026-11-08）
+
+之前仓库里所有「端到端」结论都有个共同局限：生成链路要么走 `FakeLLM`，要么走 mock 降级路径。
+**「无降级 → 正常交付」这条链路从未在真模型上跑过**（上一轮 agent 自己在风险里写了这句）。
+这次补上。
+
+## 命令
+
+```bash
+BIDPILOT_LOG=WARNING BIDPILOT_ALLOW_MOCK=0 \
+  ./.venv/Scripts/python.exe scripts/run_pipeline.py evals/datasets/tender_jiangsu.pdf \
+  --extract-json out/jiangsu_extract.json --no-db --out-dir out/real_llm
+```
+
+- 上游：本机 magpie 网关 `http://127.0.0.1:3425/v1`，模型 `qwen-cn/qwen3.8-flash`
+- 复用已落盘的抽取结果（14 块），所以只花**生成**阶段的 token
+
+## 结果
+
+| 项 | 值 |
+|---|---|
+| 退出码 | **3**（示例能力库；不是 0，见下） |
+| 章节 / 段落 | 2 节 / 135 段，因缺来源被拒 0 段 |
+| `mocked` | **False**（无模板降级） |
+| docx | `out/real_llm/tender_jiangsu_技术应答初稿.docx` **59,932 bytes**（文件名无 `_MOCK`） |
+| LLM 调用 | 12 次（生成），prompt 11,400 tok / completion 65,614 tok |
+| 耗时 | 解析+切章 4.7 s，生成 **359.6 s** |
+| 抽取质量 | 评分项 11 / 废标 35 / 技术要求 124，`needs_review` 全 0 |
+
+产物读回（python-docx）：412 个非空段落，第 2 段是示例库横幅，无模板横幅，`〔类型：…〕` 尾注 0 条
+（全部是真实生成段落，不是降级段落 —— 与 `mocked=False` 一致）。
+
+## 两个结论，别读错
+
+1. **退出码 3 是对的，不是失败**：默认能力库是示例数据，交付物「不具备商业意义」，
+   按契约 3 优先于 0。**要拿到退出码 0，必须配一份真实能力库** —— 这是产品前提，不是 bug。
+2. **生成阶段是真正的时间大头**：2 节 135 段 = 359.6 s。验收尺子里「200 页 ≤20 分钟」
+   在真实模型下主要被生成约束，解析只有 4.7 s。任何 200 页端到端承诺都必须把这部分算进去。
+
+## 仍未覆盖
+
+- 96 页的 `tender_dxh.pdf` 未跑（只有 41 页这份）。
+- 26 章 200 页是 Markdown 语料，真 PDF 端到端仍未实测（需 dev-only PDF 生成依赖）。
