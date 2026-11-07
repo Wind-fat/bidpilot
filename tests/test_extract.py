@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from bidpilot.extract import build_chunks, extract, extract_chunk
+from bidpilot.extract import build_chunks, dump_extract, extract, extract_chunk, load_extract
 from bidpilot.llm import FakeLLM
 from bidpilot.schemas import DisqualificationClause, ScoringItem, TechRequirement
 
@@ -147,3 +147,34 @@ def test_schema_rejects_missing_required_fields():
         TechRequirement(no="1", text="x", page=1)  # 缺 quote
     with pytest.raises(Exception):
         DisqualificationClause(clause_text="x", page=0, quote="y")  # 页码必须 >=1
+
+
+async def test_empty_result_is_retried_not_accepted(synthetic_doc):
+    """模型对一页返回 {} 时不能当"合法空结果"放过：先重试一次，拿到内容才算过。"""
+    llm = FakeLLM(["{}", json.dumps(VALID_SCORING, ensure_ascii=False)])
+    batch, report = await extract_chunk(llm, synthetic_doc, _chunk(synthetic_doc, "evaluation"), max_retries=2)
+    assert report.ok is True
+    assert report.attempts == 2
+    assert len(batch.scoring_items) == 1
+
+
+async def test_empty_result_exhausts_retries_as_failure(synthetic_doc):
+    """一直返回空 → 判失败（块会进 chunks_failed），不静默当成功。"""
+    llm = FakeLLM(["{}"], repeat_last=True)
+    batch, report = await extract_chunk(llm, synthetic_doc, _chunk(synthetic_doc, "evaluation"), max_retries=1)
+    assert report.ok is False
+    assert any("空结果" in e for e in report.errors)
+    assert batch.scoring_items == []
+
+
+async def test_extract_dump_roundtrip(synthetic_doc):
+    """落盘再读回：条目 id / needs_review / 逐块报告都要保真（分阶段跑依赖这个）。"""
+    llm = FakeLLM([json.dumps(VALID_SCORING, ensure_ascii=False)], repeat_last=True)
+    res = await extract(synthetic_doc, llm, max_chars=8000, max_retries=0, concurrency=1)
+    again = load_extract(json.loads(json.dumps(dump_extract(res), ensure_ascii=False)))
+
+    assert [s.id for s in again.scoring_items] == [s.id for s in res.scoring_items]
+    assert [s.quote for s in again.scoring_items] == [s.quote for s in res.scoring_items]
+    assert len(again.reports) == len(res.reports)
+    assert again.reports[0].pages == res.reports[0].pages
+    assert again.stats()["scoring_items"]["total"] == res.stats()["scoring_items"]["total"]

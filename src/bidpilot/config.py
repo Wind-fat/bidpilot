@@ -27,6 +27,16 @@ def _env_int(name: str, default: int) -> int:
     return int(_env_float(name, default))
 
 
+def _env_cache_dir() -> Path | None:
+    """BIDPILOT_CACHE_DIR：未设置 → out/_cache；设为 0/none/off → 关闭缓存。"""
+    raw = os.getenv("BIDPILOT_CACHE_DIR")
+    if raw is None:
+        return ROOT / "out" / "_cache"
+    if raw.strip().lower() in {"0", "none", "off"}:
+        return None
+    return Path(raw.strip())
+
+
 @dataclass(slots=True)
 class Settings:
     # ---- LLM（OpenAI 兼容）----
@@ -40,9 +50,11 @@ class Settings:
     # ---- 抽取 ----
     chunk_max_chars: int = field(default_factory=lambda: _env_int("BIDPILOT_CHUNK_CHARS", 3200))
     max_retries: int = field(default_factory=lambda: _env_int("BIDPILOT_MAX_RETRIES", 2))
+    gen_batch_size: int = field(default_factory=lambda: _env_int("BIDPILOT_GEN_BATCH", 12))
 
     # ---- 路径 ----
     out_dir: Path = field(default_factory=lambda: Path(os.getenv("BIDPILOT_OUT_DIR", str(ROOT / "out"))))
+    cache_dir: Path | None = field(default_factory=_env_cache_dir)
     db_path: Path = field(default_factory=lambda: Path(os.getenv("BIDPILOT_DB", str(ROOT / "out" / "bidpilot.db"))))
     capability_file: Path = field(
         default_factory=lambda: Path(

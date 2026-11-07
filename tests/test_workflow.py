@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import json
 
-from bidpilot.capabilities import CapabilityIndex, load_capabilities
+from bidpilot.capabilities import CapabilityIndex, build_matrix, load_capabilities
 from bidpilot.extract import ExtractResult
 from bidpilot.llm import FakeLLM
 from bidpilot.schemas import ScoringItem, TechRequirement
-from bidpilot.workflow import MemoryStore, Stage, WorkflowEngine, verify_citations
+from bidpilot.workflow import MemoryStore, Stage, WorkflowEngine, build_plan, verify_citations
 
 
 def _result() -> ExtractResult:
@@ -131,3 +131,38 @@ async def test_matrix_rows_have_required_fields():
     engine, _ = _engine(FakeLLM(["{}"]))
     rows = engine.matrix_rows()
     assert rows and {"requirement", "matched_capability", "status", "confidence", "evidence"} <= set(rows[0])
+
+
+def test_build_plan_groups_by_chapter_when_available():
+    """31 个表格小节不该变成 31 个生成章节：给了 chapter_of 就按章节聚合。"""
+    caps, _ = load_capabilities()
+    res = ExtractResult(title="t", source="s")
+    res.tech_requirements = [
+        TechRequirement(id="T001", no="1", text="a", page=2, page_end=2, quote="a", section="VR 头盔"),
+        TechRequirement(id="T002", no="2", text="b", page=3, page_end=3, quote="b", section="桌子"),
+    ]
+    matches = build_matrix(res.tech_requirements, res.scoring_items, res.disqualifications, CapabilityIndex(caps))
+    by_section = build_plan("d", res, matches, chapter_of=lambda p: "第四章 技术需求")
+    by_item = build_plan("d", res, matches)
+
+    assert len(by_section) == 1 and by_section[0].item_ids == ["T001", "T002"]
+    assert len(by_item) == 2  # 没有章节映射时退回条目自带的 section
+
+
+async def test_large_section_is_generated_in_batches():
+    """一条要求一次调用会被 max_tokens 截断；批次上限生效时调用次数应等于批数。"""
+    caps, _ = load_capabilities()
+    res = ExtractResult(title="t", source="s")
+    res.tech_requirements = [
+        TechRequirement(id=f"T00{i}", no=str(i), text=f"要求{i}", page=2, page_end=2, quote=f"要求{i}", section="章")
+        for i in range(1, 6)
+    ]
+    llm = FakeLLM([json.dumps({"paragraphs": [{"text": "应答", "sources": ["T001"]}]}, ensure_ascii=False)],
+                  repeat_last=True)
+    engine = WorkflowEngine("doc-batch", res, CapabilityIndex(caps), llm, MemoryStore(), batch_size=2, concurrency=2)
+    await engine.plan()
+    run = (await engine.run()).sections[0]
+
+    assert run.state == Stage.CITATION_VERIFIED.value
+    assert len(llm.calls) == 3, "5 条 / 每批 2 条 = 3 批"
+    assert len(run.paragraphs) == 3

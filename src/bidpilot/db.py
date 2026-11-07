@@ -172,11 +172,21 @@ async def save_document(
     matches: list[RequirementMatch],
     plans: list,
 ) -> None:
-    session.add(DocumentRow(id=doc_id, title=tender.title, source=str(tender.path), page_count=tender.page_count))
+    """幂等落库：同一 doc_id 重跑是 UPDATE 不是 INSERT（否则重跑必炸 UNIQUE 约束）。"""
+    doc = await session.get(DocumentRow, doc_id)
+    if doc is None:
+        session.add(DocumentRow(id=doc_id, title=tender.title, source=str(tender.path), page_count=tender.page_count))
+    else:
+        doc.title, doc.source, doc.page_count = tender.title, str(tender.path), tender.page_count
+
     m_by_req = {m.requirement_id: m for m in matches}
     section_of_item: dict[str, str] = {}
     for plan in plans:
-        session.add(SectionRow(doc_id=doc_id, section_id=plan.section_id, title=plan.title, state="planned"))
+        row = await session.get(SectionRow, (doc_id, plan.section_id))
+        if row is None:
+            session.add(SectionRow(doc_id=doc_id, section_id=plan.section_id, title=plan.title, state="planned"))
+        else:
+            row.title = plan.title  # 不覆盖 workflow 已经推进的 state
         for it in plan.items:
             section_of_item[it["id"]] = plan.section_id
 
@@ -184,21 +194,34 @@ async def save_document(
         kind = _kind_of_item(item)
         payload = item.model_dump(mode="json")
         payload["match"] = m_by_req[item.id].to_row() if item.id in m_by_req else None
-        session.add(
-            ItemRow(
-                id=item.id,
-                doc_id=doc_id,
-                kind=kind,
-                page=int(getattr(item, "page", 0) or 0),
-                section_id=section_of_item.get(item.id, ""),
-                needs_review=bool(item.needs_review),
-                payload=payload,
+        row = await session.get(ItemRow, item.id)
+        if row is None:
+            session.add(
+                ItemRow(
+                    id=item.id,
+                    doc_id=doc_id,
+                    kind=kind,
+                    page=int(getattr(item, "page", 0) or 0),
+                    section_id=section_of_item.get(item.id, ""),
+                    needs_review=bool(item.needs_review),
+                    payload=payload,
+                )
             )
-        )
+        else:
+            row.kind = kind
+            row.page = int(getattr(item, "page", 0) or 0)
+            row.section_id = section_of_item.get(item.id, "")
+            row.needs_review = bool(item.needs_review)
+            row.payload = payload
     await session.commit()
 
 
 async def save_generation(session: AsyncSession, doc_id: str, runs: list) -> None:
+    """幂等：先清掉该文档已有的段落，再写入本次生成结果（避免重跑堆叠重复段落）。"""
+    existing = (await session.execute(select(ParagraphRow).where(ParagraphRow.doc_id == doc_id))).scalars().all()
+    for row in existing:
+        await session.delete(row)
+    await session.flush()
     for run in runs:
         for i, p in enumerate(run.paragraphs):
             session.add(

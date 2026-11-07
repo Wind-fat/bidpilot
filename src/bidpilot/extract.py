@@ -11,12 +11,18 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
+import logging
 import re
-from dataclasses import dataclass, field
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 
 from .llm import LLM, LLMError, parse_json
 from .schemas import DisqualificationClause, ExtractionBatch, ScoringItem, TechRequirement
 from .sections import TenderDoc
+
+log = logging.getLogger("bidpilot.extract")
 
 TASK_SCORING = "scoring_items"
 TASK_DISQ = "disqualifications"
@@ -315,11 +321,17 @@ async def extract_chunk(llm: LLM, doc: TenderDoc, chunk: Chunk, max_retries: int
 
     for attempt in range(max_retries + 1):
         report.attempts = attempt + 1
+        t0 = time.perf_counter()
         try:
             reply = await llm.complete(messages, json_mode=True, max_tokens=6000)
         except LLMError as exc:
             report.errors = [str(exc)]
+            log.warning("chunk %s attempt %d LLM 失败 %.1fs: %s", chunk.id, attempt + 1, time.perf_counter() - t0, exc)
             continue
+        log.info(
+            "chunk %s attempt %d 返回 %d 字 / %.1fs",
+            chunk.id, attempt + 1, len(reply.text), time.perf_counter() - t0,
+        )
         try:
             batch = ExtractionBatch(**parse_json(reply.text))
         except Exception as exc:
@@ -332,6 +344,9 @@ async def extract_chunk(llm: LLM, doc: TenderDoc, chunk: Chunk, max_retries: int
             continue
 
         batch, errors = _validate(doc, chunk, batch)
+        if not errors and not (batch.scoring_items or batch.disqualifications or batch.tech_requirements):
+            # 空结果不算成功：本块被分配了抽取任务，却一条都没给出，多半是模型偷懒/输出截断。
+            errors = [f"空结果：未抽到任何条目（任务 {', '.join(chunk.tasks)}）"]
         best = batch
         if not errors:
             report.ok = True
@@ -390,16 +405,83 @@ def merge(res: ExtractResult) -> ExtractResult:
     return res
 
 
+def dump_extract(res: ExtractResult) -> dict:
+    """整份抽取结果序列化（含逐块报告），用于分阶段跑：抽取一次、生成多次。"""
+    return {
+        "title": res.title,
+        "source": res.source,
+        "scoring_items": [i.model_dump(mode="json") for i in res.scoring_items],
+        "disqualifications": [i.model_dump(mode="json") for i in res.disqualifications],
+        "tech_requirements": [i.model_dump(mode="json") for i in res.tech_requirements],
+        "reports": [asdict(r) for r in res.reports],
+        "usage": res.usage,
+    }
+
+
+def load_extract(payload: dict) -> ExtractResult:
+    reports = []
+    for r in payload.get("reports") or []:
+        rep = ChunkReport(**{**r, "pages": (int(r["pages"][0]), int(r["pages"][1]))})
+        reports.append(rep)
+    return ExtractResult(
+        title=payload.get("title", ""),
+        source=payload.get("source", ""),
+        scoring_items=[ScoringItem(**i) for i in payload.get("scoring_items") or []],
+        disqualifications=[DisqualificationClause(**i) for i in payload.get("disqualifications") or []],
+        tech_requirements=[TechRequirement(**i) for i in payload.get("tech_requirements") or []],
+        reports=reports,
+        usage=payload.get("usage") or {},
+    )
+
+
+def _cache_file(cache_dir: Path, chunk: Chunk, model: str) -> Path:
+    key = hashlib.sha1(f"{model}|{chunk.id}|{','.join(chunk.tasks)}|{chunk.body}".encode()).hexdigest()[:16]
+    return cache_dir / f"{key}.json"
+
+
 async def extract(
-    doc: TenderDoc, llm: LLM, *, max_chars: int = 3200, max_retries: int = 2, concurrency: int = 3
+    doc: TenderDoc,
+    llm: LLM,
+    *,
+    max_chars: int = 3200,
+    max_retries: int = 2,
+    concurrency: int = 3,
+    cache_dir: str | Path | None = None,
+    model: str = "",
 ) -> ExtractResult:
+    """分块抽取。cache_dir 非空时逐块落盘：超时/中断后重跑直接命中已完成的块。"""
     res = ExtractResult(title=doc.title, source=str(doc.path))
     chunks = build_chunks(doc, max_chars=max_chars)
+    cache = Path(cache_dir) if cache_dir else None
+    if cache is not None:
+        cache.mkdir(parents=True, exist_ok=True)
     sem = asyncio.Semaphore(max(1, concurrency))
+    log.info("抽取开始：%d 块 / 并发 %d / 缓存 %s", len(chunks), concurrency, cache or "关闭")
 
     async def one(chunk: Chunk):
+        path = _cache_file(cache, chunk, model) if cache is not None else None
+        if path is not None and path.exists():
+            try:
+                blob = json.loads(path.read_text(encoding="utf-8"))
+                report = ChunkReport(**blob["report"])
+                report.pages = (int(report.pages[0]), int(report.pages[1]))
+                log.info("chunk %s 命中缓存 ok=%s counts=%s", chunk.id, report.ok, report.counts)
+                return ExtractionBatch(**blob["batch"]), report
+            except Exception as exc:  # 缓存损坏就重算，不阻断
+                log.warning("chunk %s 缓存不可用（%s），重算", chunk.id, exc)
         async with sem:
-            return await extract_chunk(llm, doc, chunk, max_retries=max_retries)
+            t0 = time.perf_counter()
+            batch, report = await extract_chunk(llm, doc, chunk, max_retries=max_retries)
+            log.info(
+                "chunk %s 完成 ok=%s attempts=%d %.1fs counts=%s",
+                chunk.id, report.ok, report.attempts, time.perf_counter() - t0, report.counts,
+            )
+        if path is not None:
+            path.write_text(
+                json.dumps({"report": asdict(report), "batch": batch.model_dump(mode="json")}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        return batch, report
 
     pairs = await asyncio.gather(*(one(c) for c in chunks)) if chunks else []
     for batch, report in pairs:

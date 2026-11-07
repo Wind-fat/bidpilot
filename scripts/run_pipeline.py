@@ -10,6 +10,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
+import os
 import sys
 from pathlib import Path
 
@@ -29,7 +31,13 @@ def main() -> int:
     ap.add_argument("--no-generate", action="store_true", help="只做抽取与能力矩阵，不生成应答")
     ap.add_argument("--no-db", action="store_true", help="不写 SQLite")
     ap.add_argument("--json-out", default=None, help="把完整统计写成 JSON")
+    ap.add_argument("--extract-json", default=None, help="复用已落盘的抽取结果（跳过 LLM 抽取）")
+    ap.add_argument("--extract-out", default=None, help="抽取完成后立即把结果落盘为 JSON")
+    ap.add_argument("--verbose", "-v", action="store_true", help="打印逐块抽取进度（默认按 BIDPILOT_LOG 环境变量）")
     args = ap.parse_args()
+
+    level = os.getenv("BIDPILOT_LOG", "INFO" if args.verbose else "WARNING").upper()
+    logging.basicConfig(level=getattr(logging, level, logging.WARNING), format="%(asctime)s %(levelname)s %(message)s")
 
     s = get_settings()
     res = asyncio.run(
@@ -41,6 +49,8 @@ def main() -> int:
             generate=not args.no_generate,
             save_db=not args.no_db,
             out_dir=args.out_dir,
+            extract_json=args.extract_json,
+            extract_out=args.extract_out,
         )
     )
     stats = res.stats()
@@ -65,6 +75,12 @@ def main() -> int:
     w = stats["workflow"]
     print(f"生成章节    ：{w['sections']} 节，输出段落 {w['paragraphs']} 段，因缺来源被拒 {w['rejected_paragraphs']} 段，mocked={w['mocked']}")
     print(f"Word        ：{stats['docx']['path']}  ({stats['docx']['bytes']} bytes)")
+    u = stats["llm_usage"]
+    print(
+        f"LLM 调用    ：共 {u['calls']} 次（抽取 {u['extract_calls']} / 生成 {u['generate_calls']}），"
+        f"prompt {u['prompt_tokens']} tok / completion {u['completion_tokens']} tok"
+    )
+    print(f"耗时        ：抽取 {u['extract_seconds']}s，生成 {u['generate_seconds']}s，总计 {u['total_seconds']}s")
     print(f"能力库提示  ：{stats['capability_library_note'][:60]}...")
 
     if args.json_out:

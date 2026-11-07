@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Protocol
@@ -127,10 +128,20 @@ GEN_USER = """章节：{title}
 4. 只输出 JSON。"""
 
 
-def build_plan(doc_id: str, result: ExtractResult, matches: list[RequirementMatch]) -> list[PlannedSection]:
+def build_plan(
+    doc_id: str,
+    result: ExtractResult,
+    matches: list[RequirementMatch],
+    chapter_of=None,
+) -> list[PlannedSection]:
+    """按章节组织生成计划。
+
+    chapter_of(page) 给出该页所属的招标文件章节；有它时按**章节**聚合（一份标书通常 4-6 章，
+    而不是模型的 30+ 个表格小节），没有时退回条目自带的 section。
+    """
     by_section: dict[str, list] = {}
     for t in result.tech_requirements:
-        key = t.section or "技术要求"
+        key = (chapter_of(t.page) if chapter_of else "") or t.section or "技术要求"
         by_section.setdefault(key, []).append(t)
     match_by_req = {m.requirement_id: m for m in matches}
     plans: list[PlannedSection] = []
@@ -230,14 +241,27 @@ def _mock_paragraphs(plan: PlannedSection) -> list[dict]:
 
 
 class WorkflowEngine:
-    def __init__(self, doc_id: str, result: ExtractResult, caps: CapabilityIndex, llm: LLM, store: WorkflowStore) -> None:
+    def __init__(
+        self,
+        doc_id: str,
+        result: ExtractResult,
+        caps: CapabilityIndex,
+        llm: LLM,
+        store: WorkflowStore,
+        *,
+        chapter_of=None,
+        batch_size: int = 12,
+        concurrency: int = 3,
+    ) -> None:
         self.doc_id = doc_id
         self.result = result
         self.caps = caps
         self.llm = llm
         self.store = store
+        self.batch_size = max(1, batch_size)
+        self.concurrency = max(1, concurrency)
         self.matches = build_matrix(result.tech_requirements, result.scoring_items, result.disqualifications, caps)
-        self.plans = build_plan(doc_id, result, self.matches)
+        self.plans = build_plan(doc_id, result, self.matches, chapter_of=chapter_of)
         self.allowed: set[str] = {
             *(t.id for t in result.tech_requirements),
             *(s.id for s in result.scoring_items),
@@ -251,13 +275,42 @@ class WorkflowEngine:
         return self.plans
 
     async def generate_section(self, plan: PlannedSection, max_retries: int = 1) -> tuple[list[dict], int, bool]:
-        """返回 (原始段落, 尝试次数, 是否降级为模板)。"""
+        """按批调用模型（每批 <= batch_size 条要求），避免一次要 40 条应答被 max_tokens 截断。
+
+        返回 (原始段落, 尝试次数, 是否降级为模板)。
+        """
+        if not plan.items:
+            return [], 1, False
+        batches = [plan.items[i : i + self.batch_size] for i in range(0, len(plan.items), self.batch_size)]
+        sem = asyncio.Semaphore(self.concurrency)
+
+        async def one(batch: list[dict]):
+            async with sem:
+                return await self._generate_batch(plan, batch, max_retries)
+
+        results = await asyncio.gather(*(one(b) for b in batches))
+        paragraphs = [p for ps, _, _ in results for p in ps]
+        attempts = max(a for _, a, _ in results)
+        mocked = any(m for _, _, m in results)
+        return paragraphs, attempts, mocked
+
+    async def _generate_batch(
+        self, plan: PlannedSection, batch_items: list[dict], max_retries: int = 1
+    ) -> tuple[list[dict], int, bool]:
+        ids = {i["id"] for i in batch_items}
+        sub = PlannedSection(
+            section_id=plan.section_id,
+            title=plan.title,
+            item_ids=[i["id"] for i in batch_items],
+            items=batch_items,
+            matches=[m for m in plan.matches if m.requirement_id in ids],
+        )
         messages = [
             {"role": "system", "content": GEN_SYSTEM},
             {
                 "role": "user",
                 "content": GEN_USER.format(
-                    title=plan.title, items=_format_items(plan), matches=_format_matches(plan)
+                    title=sub.title, items=_format_items(sub), matches=_format_matches(sub)
                 ),
             },
         ]
@@ -283,7 +336,7 @@ class WorkflowEngine:
                 ]
         # 退化：模板应答（仍带来源），在结果里标 mocked
         _ = last_err
-        return _mock_paragraphs(plan), max_retries + 1, True
+        return _mock_paragraphs(sub), max_retries + 1, True
 
     async def run_section(self, plan: PlannedSection, restart: bool = False) -> SectionRun:
         run = SectionRun(section_id=plan.section_id, title=plan.title)
