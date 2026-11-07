@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>BidPilot 审核台</title>
+<style>
+  :root { --bg:#f6f7f9; --line:#dde1e6; --ink:#1f2328; --muted:#6b7280; --accent:#2d6cdf; --bad:#c62828; --ok:#1b7f3b; --warn:#a06400; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:13px/1.6 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif; color:var(--ink); background:var(--bg); }
+  header { display:flex; align-items:center; gap:12px; padding:10px 16px; border-bottom:1px solid var(--line); background:#fff; position:sticky; top:0; z-index:5; }
+  header h1 { font-size:15px; margin:0; font-weight:600; }
+  header .spacer { flex:1; }
+  select, button { font:inherit; padding:4px 8px; border:1px solid var(--line); border-radius:4px; background:#fff; cursor:pointer; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  button.small { padding:1px 6px; font-size:12px; }
+  main { display:grid; grid-template-columns: 1fr 1.15fr 1fr; gap:0; height:calc(100vh - 52px); }
+  section.col { overflow:auto; padding:10px 12px; border-right:1px solid var(--line); }
+  section.col:last-child { border-right:none; }
+  .col h2 { font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); margin:0 0 8px; }
+  .group { margin:10px 0 4px; font-weight:600; font-size:12px; color:var(--muted); }
+  .item { border:1px solid var(--line); background:#fff; border-radius:5px; padding:7px 9px; margin-bottom:6px; cursor:pointer; }
+  .item:hover { border-color:var(--accent); }
+  .item.active { border-color:var(--accent); box-shadow:0 0 0 2px #2d6cdf22; }
+  .row { display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
+  .id { font-family:Consolas, monospace; font-size:11px; color:var(--muted); }
+  .badge { font-size:11px; padding:0 5px; border-radius:3px; background:#eef1f4; color:var(--muted); }
+  .badge.bad { background:#fdecea; color:var(--bad); font-weight:600; }
+  .badge.ok { background:#e8f5ec; color:var(--ok); }
+  .badge.warn { background:#fff4e0; color:var(--warn); }
+  .status-missing { color:var(--bad); font-weight:700; }
+  .text { margin:4px 0 0; white-space:pre-wrap; }
+  .quote { margin:6px 0 0; padding:6px 8px; background:#f3f5f8; border-left:3px solid var(--line); color:#333; font-size:12px; white-space:pre-wrap; }
+  .para { border:1px solid var(--line); background:#fff; border-radius:5px; padding:8px 9px; margin-bottom:8px; }
+  .para.rejected { opacity:.55; border-style:dashed; }
+  .sources { margin-top:5px; display:flex; gap:4px; flex-wrap:wrap; }
+  .chip { font-family:Consolas, monospace; font-size:11px; background:#eef3fd; color:#2d4a8a; padding:0 5px; border-radius:3px; border:1px solid #d6e0f5; }
+  .actions { display:flex; gap:4px; margin-top:6px; }
+  .muted { color:var(--muted); }
+  .empty { color:var(--muted); padding:20px 0; text-align:center; }
+  .state { font-family:Consolas, monospace; font-size:11px; }
+  textarea { width:100%; font:inherit; min-height:60px; padding:5px; border:1px solid var(--line); border-radius:4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>BidPilot 审核台</h1>
+  <select id="docSel"></select>
+  <span class="spacer"></span>
+  <span id="hint" class="muted"></span>
+  <button id="exportBtn">导出 Word</button>
+</header>
+<main>
+  <section class="col" id="colReq">
+    <h2>招标要求</h2>
+    <div id="reqList" class="empty">加载中…</div>
+  </section>
+  <section class="col" id="colGen">
+    <h2>生成内容</h2>
+    <div id="genList" class="empty">加载中…</div>
+  </section>
+  <section class="col" id="colEv">
+    <h2>证据</h2>
+    <div id="evList" class="empty">点击左侧条目查看原文证据</div>
+  </section>
+</main>
+<script>
+const KIND_LABEL = { tech:"技术要求", scoring:"评分项", disqualification:"废标条款" };
+let DATA = null, ACTIVE = null;
+
+async function api(url, opts) {
+  const r = await fetch(url, opts);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+const esc = s => (s ?? "").toString().replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+async function boot() {
+  const docs = await api("/api/documents");
+  const sel = document.getElementById("docSel");
+  sel.innerHTML = docs.map(d => `<option value="${d.id}">${esc(d.title).slice(0,40)} · ${d.pages}p</option>`).join("");
+  sel.onchange = () => load(sel.value);
+  if (docs.length) load(docs[0].id); else document.getElementById("reqList").textContent = "库里还没有文档，先跑 scripts/run_pipeline.py";
+}
+
+async function load(docId) {
+  DATA = await api(`/api/documents/${docId}`);
+  renderReq(); renderGen(); renderEv();
+  const bad = DATA.items.filter(i => i.payload.match && i.payload.match.status === "不满足").length;
+  document.getElementById("hint").textContent = `${DATA.items.length} 条目 · ${bad} 条能力不满足 · ${DATA.sections.length} 节`;
+}
+
+function itemText(it) {
+  const p = it.payload;
+  if (it.kind === "tech") return p.text;
+  if (it.kind === "scoring") return `${p.item}｜${p.criteria_text}`;
+  return p.clause_text;
+}
+
+function renderReq() {
+  const groups = { tech:[], scoring:[], disqualification:[] };
+  DATA.items.forEach(i => (groups[i.kind] || (groups[i.kind]=[])).push(i));
+  let html = "";
+  for (const [kind, items] of Object.entries(groups)) {
+    if (!items.length) continue;
+    html += `<div class="group">${KIND_LABEL[kind] || kind} · ${items.length}</div>`;
+    for (const it of items) {
+      const m = it.payload.match;
+      const status = m ? m.status : "—";
+      const cls = status === "不满足" ? "bad" : status === "满足" ? "ok" : "warn";
+      html += `<div class="item ${ACTIVE===it.id?"active":""}" data-id="${it.id}">
+        <div class="row">
+          <span class="id">${it.id}</span>
+          <span class="badge">p${it.page}</span>
+          <span class="badge ${cls}">${status}</span>
+          ${it.needs_review ? '<span class="badge bad">needs_review</span>' : ''}
+          ${it.status !== "pending" ? `<span class="badge">${it.status}</span>` : ''}
+        </div>
+        <div class="text">${esc(itemText(it)).slice(0, 220)}</div>
+      </div>`;
+    }
+  }
+  const list = document.getElementById("reqList");
+  list.className = "";
+  list.innerHTML = html || '<div class="empty">没有条目</div>';
+  list.querySelectorAll(".item").forEach(el => el.onclick = () => { ACTIVE = el.dataset.id; renderReq(); renderGen(); renderEv(); });
+}
+
+function renderGen() {
+  const active = DATA.items.find(i => i.id === ACTIVE);
+  const sections = active ? DATA.sections.filter(s => s.section_id === active.section_id) : DATA.sections;
+  let html = "";
+  for (const sec of sections) {
+    html += `<div class="group">${esc(sec.title)} <span class="state muted">[${sec.state}]</span></div>`;
+    if (!sec.paragraphs.length) html += '<div class="empty">该节没有通过引用校验的段落</div>';
+    for (const p of sec.paragraphs) {
+      const rejected = p.state === "rejected";
+      html += `<div class="para ${rejected?"rejected":""}">
+        <div class="row"><span class="id">#${p.id}</span><span class="badge">${esc(p.kind)}</span>
+          ${p.state !== "pending" ? `<span class="badge">${p.state}</span>` : ""}</div>
+        <div class="text">${esc(p.text)}</div>
+        <div class="sources">${p.sources.map(s => `<span class="chip">${esc(s)}</span>`).join("")}</div>
+        <div class="actions">
+          <button class="small" data-act="accept" data-id="${p.id}">接受</button>
+          <button class="small" data-act="edit" data-id="${p.id}">改写</button>
+          <button class="small" data-act="reject" data-id="${p.id}">拒绝</button>
+        </div>
+      </div>`;
+    }
+  }
+  const el = document.getElementById("genList");
+  el.className = "";
+  el.innerHTML = html || '<div class="empty">没有生成内容</div>';
+  el.querySelectorAll("button[data-act]").forEach(btn => btn.onclick = () => reviewParagraph(btn.dataset.id, btn.dataset.act));
+}
+
+async function reviewParagraph(id, action) {
+  let edited = "";
+  if (action === "edit") {
+    const cur = DATA.sections.flatMap(s => s.paragraphs).find(p => String(p.id) === String(id));
+    edited = prompt("改写后的段落：", cur ? cur.text : "");
+    if (edited === null) return;
+  }
+  await api("/api/review", { method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({ target_type:"paragraph", target_id:String(id), action, edited_text: edited }) });
+  await load(DATA.doc.id);
+}
+
+function renderEv() {
+  const el = document.getElementById("evList");
+  if (!ACTIVE) return;
+  const it = DATA.items.find(i => i.id === ACTIVE);
+  const p = it.payload, m = p.match;
+  const sec = DATA.sections.find(s => s.section_id === it.section_id);
+  let html = `<div class="group">条目 ${it.id}（p${it.page}）</div>`;
+  html += `<div class="para"><div class="text">${esc(itemText(it))}</div></div>`;
+  html += `<div class="group">原文 quote（逐字校验通过）</div><div class="quote">${esc(p.quote)}</div>`;
+  html += `<div class="group">能力匹配</div>`;
+  if (m) {
+    html += `<div class="para">
+      <div class="row"><span class="${m.status==="不满足"?"status-missing":""}">${m.status}</span>
+        <span class="badge">conf ${m.confidence}</span></div>
+      <div class="text">${esc(m.matched_capability || "（无匹配能力）")}</div>
+      <div class="muted" style="font-size:12px;margin-top:4px">${esc(m.evidence)}</div>
+      ${m.alternatives && m.alternatives.length ? `<div class="sources">${m.alternatives.map(a=>`<span class="chip">${esc(a)}</span>`).join("")}</div>` : ""}
+    </div>`;
+  } else html += '<div class="empty">未参与能力匹配</div>';
+  if (it.needs_review) html += `<div class="group">待复核原因</div><div class="quote">${esc((p.review_reasons||[]).join("；"))}</div>`;
+  html += `<div class="group">所属生成节</div><div class="state muted">${esc(sec ? sec.section_id + " · " + sec.state : "（无）")}</div>`;
+  el.className = "";
+  el.innerHTML = html;
+}
+
+document.getElementById("exportBtn").onclick = () => {
+  if (!DATA) return;
+  window.open(`/api/documents/${DATA.doc.id}/export`, "_blank");
+};
+boot().catch(e => { document.getElementById("reqList").textContent = "加载失败：" + e.message; });
+</script>
+</body>
+</html>

@@ -1,0 +1,11 @@
+.env
+*.db
+*.db-wal
+*.db-shm
+.models/
+data/
+node_modules/
+.next/
+out/
+__pycache__/
+.venv/
