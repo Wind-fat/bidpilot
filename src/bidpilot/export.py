@@ -13,7 +13,11 @@ from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Pt
+from docx.shared import Pt, RGBColor
+
+# 首页横幅文案：两种降级必须用**不同**措辞，评审员要能一眼分清"没调模型"和"能力库是假的"
+BANNER_MOCK = "本节为模板应答，未调用模型（LLM 不可用，已启用模板降级 BIDPILOT_ALLOW_MOCK=1）"
+BANNER_EXAMPLE_CAPS = "当前能力库为示例数据（EXAMPLE DATA），需求-能力匹配结果不具备商业意义"
 
 
 def _set_cn_font(document: Document, name: str = "宋体") -> None:
@@ -46,8 +50,34 @@ def add_toc(document: Document, levels: str = "1-3") -> None:
         run._r.append(node)
 
 
-def build_docx(payload: dict, out_path: str | Path) -> Path:
-    """payload: {title, doc_id, sections: [{title, items, paragraphs:[{text, sources, kind}]}]}"""
+def _add_banner(document: Document, text: str, fill: str = "FFF2CC") -> None:
+    """首页加粗横幅：写进文档正文（不是页眉/批注），python-docx 读得回、评审员一眼看得见。"""
+    p = document.add_paragraph()
+    ppr = p._p.get_or_add_pPr()
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:val"), "clear")
+    shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:fill"), fill)
+    ppr.append(shd)  # shd 在 pPr 序列里排在 jc/spacing 之前，先 append 再设对齐
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = p.add_run(text)
+    run.bold = True
+    run.font.size = Pt(14)
+    run.font.color.rgb = RGBColor(0xC0, 0x00, 0x00)
+
+
+def build_docx(
+    payload: dict,
+    out_path: str | Path,
+    *,
+    mocked: bool = False,
+    example_capabilities: bool = False,
+) -> Path:
+    """payload: {title, doc_id, sections: [{title, items, paragraphs:[{text, sources, kind}]}]}
+
+    `mocked` / `example_capabilities` 为真时在首页插横幅：这两种情况下的文档内容
+    不能当作投标交付物，必须让打开文件的人立刻知道。
+    """
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     document = Document()
@@ -58,6 +88,11 @@ def build_docx(payload: dict, out_path: str | Path) -> Path:
     run = title.add_run(payload.get("title") or "技术应答初稿")
     run.bold = True
     run.font.size = Pt(20)
+
+    if mocked:
+        _add_banner(document, BANNER_MOCK)
+    if example_capabilities:
+        _add_banner(document, BANNER_EXAMPLE_CAPS, fill="DDEBF7")
 
     meta = document.add_paragraph()
     meta.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -100,6 +135,14 @@ def build_docx(payload: dict, out_path: str | Path) -> Path:
                 ev_run = ev.add_run(evidence)
                 ev_run.italic = True
                 ev_run.font.size = Pt(8)
+                # kind 必须落文档：被降级段落靠这行尾注自我暴露，不能只存在于 JSON 里
+                kind = str(p.get("kind") or "").strip()
+                if kind and kind != "技术响应":
+                    note = ev.add_run(f"　〔类型：{kind}〕")
+                    note.font.size = Pt(8)
+                    if "模板" in kind:
+                        note.bold = True
+                        note.font.color.rgb = RGBColor(0xC0, 0x00, 0x00)
 
     document.save(str(out))
     return out

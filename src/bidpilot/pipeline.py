@@ -15,11 +15,19 @@ from pathlib import Path
 from .capabilities import CapabilityIndex, RequirementMatch, build_matrix, load_capabilities
 from .config import Settings, get_settings
 from .db import SqliteStore, init_db, make_engine, save_document, save_generation
-from .export import build_docx
+from .export import BANNER_EXAMPLE_CAPS, BANNER_MOCK, build_docx
 from .extract import ExtractResult, dump_extract, extract, load_extract
 from .llm import ChatClient, LLM
 from .sections import TenderDoc, load_tender
 from .workflow import MemoryStore, WorkflowEngine, WorkflowResult
+
+# 退出码：非零的含义必须稳定（脚本/CI 会按值判断），且优先级见 PipelineResult.exit_code
+EXIT_OK = 0
+EXIT_TEMPLATE_FALLBACK = 2  # 有章节被降级为模板应答（未调用模型）
+EXIT_EXAMPLE_CAPABILITIES = 3  # 能力库是示例数据，匹配结果无商业意义
+EXIT_INCOMPLETE = 4  # 有章节整节失败 / 部分批次失败，交付物不完整
+
+MOCK_SUFFIX = "_MOCK"
 
 
 @dataclass(slots=True)
@@ -33,21 +41,70 @@ class PipelineResult:
     docx_path: Path
     docx_bytes: int = 0
     capability_meta: str = ""
+    example_capabilities: bool = False
+    allow_mock: bool = False
     plans: list = field(default_factory=list)
     timing: dict = field(default_factory=dict)
     llm_usage: dict = field(default_factory=dict)
+
+    def problems(self) -> list[dict]:
+        """交付物污染清单的汇总视图：workflow 的三个级别 + 示例能力库。"""
+        out = list(self.workflow.problems())
+        if self.example_capabilities:
+            out.append(
+                {
+                    "section_id": "capability-library",
+                    "title": "能力库",
+                    "severity": "example_capabilities",
+                    "reason": BANNER_EXAMPLE_CAPS,
+                }
+            )
+        return out
+
+    @property
+    def exit_code(self) -> int:
+        """0 = 交付物无污染；否则按严重度给出稳定码（模板应答 > 内容不完整 > 示例库）。"""
+        sev = {p["severity"] for p in self.problems()}
+        if "mocked" in sev:
+            return EXIT_TEMPLATE_FALLBACK
+        if {"failed", "incomplete"} & sev:
+            return EXIT_INCOMPLETE
+        if "example_capabilities" in sev:
+            return EXIT_EXAMPLE_CAPABILITIES
+        return EXIT_OK
 
     def stats(self) -> dict:
         return {
             "doc_id": self.doc_id,
             "extraction": self.extraction.stats(),
             "capability_matrix": _matrix_stats(self.matches),
+            "capability_library": {
+                "note": self.capability_meta,
+                "is_example": self.example_capabilities,
+            },
             "workflow": self.workflow.stats(),
+            "delivery": {
+                "problems": self.problems(),
+                "exit_code": self.exit_code,
+                "mock_allowed": self.allow_mock,
+            },
             "docx": {"path": str(self.docx_path), "bytes": self.docx_bytes},
             "capability_library_note": self.capability_meta,
             "timing": self.timing,
             "llm_usage": self.llm_usage,
         }
+
+
+def format_degradation_report(result: PipelineResult) -> list[str]:
+    """CLI 用的降级清单（纯字符串，便于测试断言"确实打印了被降级的章节"）。"""
+    rows = result.problems()
+    if not rows:
+        return []
+    lines = ["交付物可信度告警（本文件不得直接提交）："]
+    for p in rows:
+        lines.append(f"  ! [{p['severity']}] {p['section_id']} / {p['title']}：{p['reason']}")
+    lines.append(f"  → 退出码 {result.exit_code}（2=模板应答 3=示例能力库 4=内容不完整）")
+    return lines
 
 
 def _matrix_stats(matches: list[RequirementMatch]) -> dict:
@@ -113,8 +170,8 @@ async def run_pipeline(
     ) if isinstance(client, ChatClient) else (0, 0)
     t_gen0 = time.perf_counter()
 
-    caps, cap_meta = load_capabilities(s.capability_file)
-    index = CapabilityIndex(caps)
+    caps_lib = load_capabilities(s.capability_file)
+    index = CapabilityIndex(caps_lib.capabilities)
     matches = build_matrix(extraction.tech_requirements, extraction.scoring_items, extraction.disqualifications, index)
 
     engine = make_engine(s.db_path) if save_db else None
@@ -138,13 +195,16 @@ async def run_pipeline(
         chapter_of=_chapter_of,
         batch_size=s.gen_batch_size,
         concurrency=concurrency,
+        allow_mock=s.allow_mock,
     )
     plans = await wf_engine.plan()
     workflow = await wf_engine.run() if generate else WorkflowResult(doc_id=doc_id)
     aggregated = await wf_engine.aggregate() if generate else {"doc_id": doc_id, "title": tender.title, "sections": []}
 
-    docx_path = out / f"{Path(pdf_path).stem}_技术应答初稿.docx"
-    build_docx(aggregated, docx_path)
+    # 模板降级的产物必须在文件名上就暴露，不能和真实生成的文件同名
+    suffix = MOCK_SUFFIX if workflow.mocked else ""
+    docx_path = out / f"{Path(pdf_path).stem}_技术应答初稿{suffix}.docx"
+    build_docx(aggregated, docx_path, mocked=workflow.mocked, example_capabilities=caps_lib.is_example)
 
     if engine is not None:
         from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -191,7 +251,9 @@ async def run_pipeline(
         aggregated=aggregated,
         docx_path=docx_path,
         docx_bytes=docx_path.stat().st_size,
-        capability_meta=cap_meta,
+        capability_meta=caps_lib.meta,
+        example_capabilities=caps_lib.is_example,
+        allow_mock=s.allow_mock,
         plans=plans,
         timing={"extract_s": extract_s, "generate_s": gen_s, "total_s": total_s},
         llm_usage=usage_summary,

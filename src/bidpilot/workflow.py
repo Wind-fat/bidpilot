@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Protocol
 
-from .capabilities import MISSING, SATISFIED, CapabilityIndex, RequirementMatch, build_matrix
+from .capabilities import MISSING, NEEDS_REVIEW, SATISFIED, CapabilityIndex, RequirementMatch, build_matrix
 from .extract import ExtractResult
 from .llm import LLM, LLMError, parse_json
 from .schemas import GeneratedParagraph
@@ -98,10 +98,38 @@ class WorkflowResult:
             "paragraphs": sum(len(s.paragraphs) for s in self.sections),
             "rejected_paragraphs": sum(len(s.rejected) for s in self.sections),
             "mocked": self.mocked,
+            "mocked_sections": [p["section_id"] for p in self.problems() if p["severity"] == "mocked"],
+            "failed_sections": [s.section_id for s in self.sections if s.state == Stage.FAILED.value],
+            "incomplete_sections": [p["section_id"] for p in self.problems() if p["severity"] == "incomplete"],
             "states": {s.section_id: s.state for s in self.sections},
             "prompt_tokens": self.usage_prompt_tokens,
             "completion_tokens": self.usage_completion_tokens,
         }
+
+    def problems(self) -> list[dict]:
+        """交付物污染清单：模板应答 / 整节点失败 / 部分批次失败，CLI 必须原样打印。"""
+        out: list[dict] = []
+        for s in self.sections:
+            if s.mocked:
+                out.append(
+                    {"section_id": s.section_id, "title": s.title, "severity": "mocked",
+                     "reason": "本节为模板应答（未调用模型）"}
+                )
+            elif s.state == Stage.FAILED.value:
+                out.append(
+                    {"section_id": s.section_id, "title": s.title, "severity": "failed",
+                     "reason": s.error or "本节没有产出任何应答"}
+                )
+            elif s.error:
+                out.append(
+                    {"section_id": s.section_id, "title": s.title, "severity": "incomplete",
+                     "reason": s.error}
+                )
+        return out
+
+    def degraded_sections(self) -> list[dict]:
+        """被降级为模板应答的章节（横幅与 `_MOCK` 后缀的判定依据）。"""
+        return [p for p in self.problems() if p["severity"] == "mocked"]
 
 
 GEN_SYSTEM = (
@@ -221,7 +249,7 @@ def _mock_paragraphs(plan: PlannedSection) -> list[dict]:
     match_by_req = {m.requirement_id: m for m in plan.matches}
     for item in plan.items:
         m = match_by_req.get(item["id"])
-        if m and m.status != MISSING:
+        if m and m.status not in (MISSING, NEEDS_REVIEW):
             out.append(
                 {
                     "text": f"针对贵方要求「{item['text'][:80]}」，我方以{m.matched_capability}响应（{m.status}，置信度 {m.confidence}）。",
@@ -252,12 +280,14 @@ class WorkflowEngine:
         chapter_of=None,
         batch_size: int = 12,
         concurrency: int = 3,
+        allow_mock: bool = False,
     ) -> None:
         self.doc_id = doc_id
         self.result = result
         self.caps = caps
         self.llm = llm
         self.store = store
+        self.allow_mock = allow_mock
         self.batch_size = max(1, batch_size)
         self.concurrency = max(1, concurrency)
         self.matches = build_matrix(result.tech_requirements, result.scoring_items, result.disqualifications, caps)
@@ -274,13 +304,14 @@ class WorkflowEngine:
             await self.store.set_state(self.doc_id, plan.section_id, Stage.PLANNED.value, f"{len(plan.items)} 条要求")
         return self.plans
 
-    async def generate_section(self, plan: PlannedSection, max_retries: int = 1) -> tuple[list[dict], int, bool]:
+    async def generate_section(self, plan: PlannedSection, max_retries: int = 1) -> tuple[list[dict], int, bool, str]:
         """按批调用模型（每批 <= batch_size 条要求），避免一次要 40 条应答被 max_tokens 截断。
 
-        返回 (原始段落, 尝试次数, 是否降级为模板)。
+        返回 (原始段落, 尝试次数, 是否降级为模板, 失败原因)。
+        失败原因为空表示模型正常返回。
         """
         if not plan.items:
-            return [], 1, False
+            return [], 1, False, ""
         batches = [plan.items[i : i + self.batch_size] for i in range(0, len(plan.items), self.batch_size)]
         sem = asyncio.Semaphore(self.concurrency)
 
@@ -289,14 +320,15 @@ class WorkflowEngine:
                 return await self._generate_batch(plan, batch, max_retries)
 
         results = await asyncio.gather(*(one(b) for b in batches))
-        paragraphs = [p for ps, _, _ in results for p in ps]
-        attempts = max(a for _, a, _ in results)
-        mocked = any(m for _, _, m in results)
-        return paragraphs, attempts, mocked
+        paragraphs = [p for ps, _, _, _ in results for p in ps]
+        attempts = max(a for _, a, _, _ in results)
+        mocked = any(m for _, _, m, _ in results)
+        errors = [e for *_, e in results if e]
+        return paragraphs, attempts, mocked, "; ".join(dict.fromkeys(errors))
 
     async def _generate_batch(
         self, plan: PlannedSection, batch_items: list[dict], max_retries: int = 1
-    ) -> tuple[list[dict], int, bool]:
+    ) -> tuple[list[dict], int, bool, str]:
         ids = {i["id"] for i in batch_items}
         sub = PlannedSection(
             section_id=plan.section_id,
@@ -326,7 +358,7 @@ class WorkflowEngine:
                 paragraphs = data.get("paragraphs") or []
                 if not isinstance(paragraphs, list) or not paragraphs:
                     raise LLMError("paragraphs 为空")
-                return paragraphs, attempt + 1, False
+                return paragraphs, attempt + 1, False, ""
             except LLMError as exc:
                 last_err = str(exc)
                 messages = [
@@ -334,9 +366,10 @@ class WorkflowEngine:
                     {"role": "assistant", "content": reply.text[:3000]},
                     {"role": "user", "content": f"输出不合规：{exc}。请重新输出 JSON，键为 paragraphs。"},
                 ]
-        # 退化：模板应答（仍带来源），在结果里标 mocked
-        _ = last_err
-        return _mock_paragraphs(sub), max_retries + 1, True
+        # 退化：模板应答（仍带来源），在结果里标 mocked —— 且只有在显式开启时才允许
+        if not self.allow_mock:
+            return [], max_retries + 1, False, last_err or "LLM 不可用"
+        return _mock_paragraphs(sub), max_retries + 1, True, ""
 
     async def run_section(self, plan: PlannedSection, restart: bool = False) -> SectionRun:
         run = SectionRun(section_id=plan.section_id, title=plan.title)
@@ -349,7 +382,7 @@ class WorkflowEngine:
                 run.rejected = list(saved.get("rejected") or [])
                 return run
 
-        raw, attempts, mocked = await self.generate_section(plan)
+        raw, attempts, mocked, err = await self.generate_section(plan)
         run.attempts, run.mocked = attempts, mocked
         await self.store.set_state(self.doc_id, plan.section_id, Stage.GENERATED.value, f"attempts={attempts} mocked={mocked}")
 
@@ -357,13 +390,23 @@ class WorkflowEngine:
         run.paragraphs, run.rejected = accepted, rejected
         if not accepted:
             run.state = Stage.FAILED.value
-            run.error = "全部段落因缺少来源被拒绝"
+            # 降级未开启时的失败要能自解释：不是"模型答得差"，而是"模型没跑起来"
+            run.error = (
+                f"LLM 不可用且未开启模板降级（{err}）；本节点未产出任何应答"
+                if err and not mocked
+                else "全部段落因缺少来源被拒绝"
+            )
             await self.store.set_state(self.doc_id, plan.section_id, Stage.FAILED.value, run.error)
             await self.store.save_section(self.doc_id, plan.section_id, [], rejected)
             return run
 
         run.state = Stage.CITATION_VERIFIED.value
-        await self.store.set_state(self.doc_id, plan.section_id, Stage.CITATION_VERIFIED.value, f"accepted={len(accepted)}")
+        if err and not mocked:
+            # 有批次失败但仍有段落通过校验：内容不完整，必须留下痕迹（否则等于静默少答）
+            run.error = f"部分批次未取到模型输出（{err}）；本节内容不完整"
+        await self.store.set_state(
+            self.doc_id, plan.section_id, Stage.CITATION_VERIFIED.value, f"accepted={len(accepted)} {run.error}".strip()
+        )
         await self.store.save_section(self.doc_id, plan.section_id, accepted, rejected)
         return run
 

@@ -95,10 +95,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             result = await rebuild_extraction(session, doc_id)
             if not result.items():
                 raise HTTPException(404, f"文档没有可重跑的条目: {doc_id}")
-        caps, _ = load_capabilities(s.capability_file)
+        caps = load_capabilities(s.capability_file).capabilities
         client = ChatClient(s)
         try:
-            wf = WorkflowEngine(doc_id, result, CapabilityIndex(caps), client, SqliteStore(sf))
+            wf = WorkflowEngine(
+                doc_id, result, CapabilityIndex(caps), client, SqliteStore(sf), allow_mock=s.allow_mock
+            )
             run = await wf.run(only_section=section_id, restart=True)
         finally:
             await client.aclose()
@@ -111,7 +113,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not view["sections"]:
             raise HTTPException(409, "没有通过引用校验的章节，无法导出")
         out = s.out_dir / f"{doc_id}_审核版.docx"
-        build_docx(view, out)
+        build_docx(view, out, example_capabilities=load_capabilities(s.capability_file).is_example)
         return FileResponse(str(out), filename=out.name)
 
     return app

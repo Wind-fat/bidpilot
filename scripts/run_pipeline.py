@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from bidpilot.config import get_settings  # noqa: E402
-from bidpilot.pipeline import run_pipeline  # noqa: E402
+from bidpilot.pipeline import format_degradation_report, run_pipeline  # noqa: E402
 
 
 def main() -> int:
@@ -81,7 +81,8 @@ def main() -> int:
         f"prompt {u['prompt_tokens']} tok / completion {u['completion_tokens']} tok"
     )
     print(f"耗时        ：抽取 {u['extract_seconds']}s，生成 {u['generate_seconds']}s，总计 {u['total_seconds']}s")
-    print(f"能力库提示  ：{stats['capability_library_note'][:60]}...")
+    flag = "**示例数据（不可作为投标依据）**" if stats["capability_library"]["is_example"] else "已配置"
+    print(f"能力库      ：{flag} —— {stats['capability_library_note'][:50]}...")
 
     if args.json_out:
         Path(args.json_out).parent.mkdir(parents=True, exist_ok=True)
@@ -94,7 +95,13 @@ def main() -> int:
         }
         Path(args.json_out).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"JSON        ：{args.json_out}")
-    return 0
+
+    report = format_degradation_report(res)
+    if report:
+        print("=" * 68)
+        for line in report:
+            print(line)
+    return res.exit_code
 
 
 if __name__ == "__main__":

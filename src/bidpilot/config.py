@@ -1,7 +1,11 @@
 """运行配置。
 
-所有可调项都从环境变量读，默认值保证「本机 magpie 网关闭着也能跑」的降级路径可见：
-LLM 不可用时 workflow 走 `BIDPILOT_ALLOW_MOCK=1` 的模板应答（仍带来源，会在报告里标注 mocked）。
+所有可调项都从环境变量读。
+
+关于降级：LLM 不可用时**默认直接失败**（该章节标 failed，不产出模板句）。
+模板应答（`workflow._mock_paragraphs`）只能通过 `BIDPILOT_ALLOW_MOCK=1` 显式开启，
+且一旦启用，docx 带着横幅 + `_MOCK` 文件名后缀、CLI 返回非零退出码——
+因为「看起来能交、实际是模板句」的交付物比报错危险得多。
 """
 
 from __future__ import annotations
@@ -27,6 +31,14 @@ def _env_int(name: str, default: int) -> int:
     return int(_env_float(name, default))
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    """布尔开关：只认显式的真值（1/true/yes/on），其余一律 False（含未设置）。"""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _env_cache_dir() -> Path | None:
     """BIDPILOT_CACHE_DIR：未设置 → out/_cache；设为 0/none/off → 关闭缓存。"""
     raw = os.getenv("BIDPILOT_CACHE_DIR")
@@ -45,7 +57,8 @@ class Settings:
     llm_model: str = field(default_factory=lambda: os.getenv("BIDPILOT_LLM_MODEL", "qwen-cn/qwen3.8-flash"))
     llm_timeout_s: float = field(default_factory=lambda: _env_float("BIDPILOT_LLM_TIMEOUT_S", 180.0))
     llm_temperature: float = field(default_factory=lambda: _env_float("BIDPILOT_LLM_TEMPERATURE", 0.0))
-    allow_mock: bool = field(default_factory=lambda: os.getenv("BIDPILOT_ALLOW_MOCK", "1") != "0")
+    # 模板降级默认关闭：LLM 不可用时章节直接 failed，不产出"看起来能交"的模板句。
+    allow_mock: bool = field(default_factory=lambda: _env_flag("BIDPILOT_ALLOW_MOCK", False))
 
     # ---- 抽取 ----
     chunk_max_chars: int = field(default_factory=lambda: _env_int("BIDPILOT_CHUNK_CHARS", 3200))

@@ -24,10 +24,10 @@ def _result() -> ExtractResult:
     return res
 
 
-def _engine(llm) -> tuple[WorkflowEngine, MemoryStore]:
-    caps, _ = load_capabilities()
+def _engine(llm, allow_mock: bool = False) -> tuple[WorkflowEngine, MemoryStore]:
+    caps = load_capabilities().capabilities
     store = MemoryStore()
-    return WorkflowEngine("doc-test", _result(), CapabilityIndex(caps), llm, store), store
+    return WorkflowEngine("doc-test", _result(), CapabilityIndex(caps), llm, store, allow_mock=allow_mock), store
 
 
 def test_verify_citations_drops_sourceless_and_unknown():
@@ -104,7 +104,7 @@ async def test_mock_fallback_when_llm_unavailable():
 
             raise LLMError("connection refused")
 
-    engine, _ = _engine(Down())
+    engine, _ = _engine(Down(), allow_mock=True)  # 模板降级必须显式开启（默认关）
     await engine.plan()
     res = await engine.run()
     assert res.mocked is True
@@ -135,7 +135,7 @@ async def test_matrix_rows_have_required_fields():
 
 def test_build_plan_groups_by_chapter_when_available():
     """31 个表格小节不该变成 31 个生成章节：给了 chapter_of 就按章节聚合。"""
-    caps, _ = load_capabilities()
+    caps = load_capabilities().capabilities
     res = ExtractResult(title="t", source="s")
     res.tech_requirements = [
         TechRequirement(id="T001", no="1", text="a", page=2, page_end=2, quote="a", section="VR 头盔"),
@@ -151,7 +151,7 @@ def test_build_plan_groups_by_chapter_when_available():
 
 async def test_large_section_is_generated_in_batches():
     """一条要求一次调用会被 max_tokens 截断；批次上限生效时调用次数应等于批数。"""
-    caps, _ = load_capabilities()
+    caps = load_capabilities().capabilities
     res = ExtractResult(title="t", source="s")
     res.tech_requirements = [
         TechRequirement(id=f"T00{i}", no=str(i), text=f"要求{i}", page=2, page_end=2, quote=f"要求{i}", section="章")
