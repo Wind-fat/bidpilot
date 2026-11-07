@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from pydantic import ValidationError
 
 from bidpilot.extract import build_chunks, dump_extract, extract, extract_chunk, load_extract
 from bidpilot.llm import FakeLLM
@@ -141,11 +142,11 @@ async def test_merge_dedupes_across_chunks(synthetic_doc):
 
 
 def test_schema_rejects_missing_required_fields():
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         ScoringItem(no="1", item="价格", criteria_text="x", page=1)  # 缺 quote
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         TechRequirement(no="1", text="x", page=1)  # 缺 quote
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         DisqualificationClause(clause_text="x", page=0, quote="y")  # 页码必须 >=1
 
 
@@ -178,3 +179,61 @@ async def test_extract_dump_roundtrip(synthetic_doc):
     assert len(again.reports) == len(res.reports)
     assert again.reports[0].pages == res.reports[0].pages
     assert again.stats()["scoring_items"]["total"] == res.stats()["scoring_items"]["total"]
+
+
+# ------------------------------------------------- P1-07 章节边界（字符偏移）
+
+def test_same_page_chunks_do_not_leak_neighbour_chapter(synthetic_doc):
+    """同一页起两章：块正文按章节字符边界截断，不把邻章内容带进提示词。"""
+    chunks = build_chunks(synthetic_doc, max_chars=8000)
+    bid = next(c for c in chunks if c.section_kind == "bidder_instructions")
+    ev = next(c for c in chunks if c.section_kind == "evaluation")
+
+    assert bid.page_start == bid.page_end == 1 and ev.page_start == ev.page_end == 1
+    assert bid.char_end < ev.char_start, "同页两块必须有先后、不重叠"
+    assert "2.1 价格分" not in bid.body, "前一章的块里混进了后一章正文"
+    assert "1.1 投标文件" not in ev.body, "后一章的块里混进了前一章正文"
+    assert bid.body.split("\n", 1)[1].startswith("第一章 投标人须知")
+    assert ev.body.split("\n", 1)[1].startswith("第二章 评标办法")
+    assert "第二章" not in bid.body and "第一章" not in ev.body
+
+
+async def test_quote_from_previous_chapter_on_same_page_is_rejected(synthetic_doc):
+    """quote 在"这一页"存在，但位于上一章的字符区间里 → 必须判 needs_review（P1-07）。"""
+    payload = {
+        "scoring_items": [
+            {
+                "no": "2.1",
+                "item": "价格",
+                "criteria_text": "低价优先法",
+                "max_score": 40,
+                "page": 1,
+                "quote": "1.1 投标文件未按招标文件要求密封的，作无效投标处理。",
+            }
+        ]
+    }
+    llm = FakeLLM([json.dumps(payload, ensure_ascii=False)])
+    batch, report = await extract_chunk(llm, synthetic_doc, _chunk(synthetic_doc, "evaluation"), max_retries=0)
+
+    assert report.ok is False
+    item = batch.scoring_items[0]
+    assert item.needs_review is True
+    assert any("上一章节" in r for r in item.review_reasons), item.review_reasons
+
+
+async def test_quote_in_next_chapter_on_same_page_is_rejected_on_page_end(synthetic_doc):
+    """落在本章终点之后的 quote（同页下一章）同样要被拦下。"""
+    page2 = synthetic_doc.page_text(2)
+    assert "4.1 合同签订后" in page2
+    payload = {
+        "tech_requirements": [
+            {"no": "3.1", "text": "x", "page": 2, "page_end": 2, "quote": "4.1 合同签订后 30 日内交货"}
+        ]
+    }
+    llm = FakeLLM([json.dumps(payload, ensure_ascii=False)])
+    batch, report = await extract_chunk(llm, synthetic_doc, _chunk(synthetic_doc, "technical"), max_retries=0)
+
+    assert report.ok is False
+    item = batch.tech_requirements[0]
+    assert item.needs_review is True
+    assert any("下一章节" in r for r in item.review_reasons), item.review_reasons

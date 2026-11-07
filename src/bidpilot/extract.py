@@ -20,7 +20,7 @@ from pathlib import Path
 
 from .llm import LLM, LLMError, parse_json
 from .schemas import DisqualificationClause, ExtractionBatch, ScoringItem, TechRequirement
-from .sections import TenderDoc
+from .sections import Section, TenderDoc
 
 log = logging.getLogger("bidpilot.extract")
 
@@ -94,6 +94,9 @@ class Chunk:
     section_kind: str
     tasks: list[str]
     body: str
+    # 章节在首/尾页的页内字符边界：本块只允许这两处被截断，中间页取全页（P1-07）
+    char_start: int = 0
+    char_end: int = -1
 
     @property
     def id(self) -> str:
@@ -156,44 +159,55 @@ def _tasks_for(section_kind: str, text: str) -> list[str]:
     return tasks
 
 
-def build_chunks(doc: TenderDoc, max_chars: int = 3200) -> list[Chunk]:
+def _section_chunks(doc: TenderDoc, section: Section, max_chars: int) -> list[Chunk]:
+    """把一个章节按 max_chars 装箱成块。首/尾页按章节字符边界截断，中间页整页取。"""
     chunks: list[Chunk] = []
-    for section in doc.sections:
-        if section.kind not in EXTRACT_KINDS:
-            continue
-        pending: list[tuple[int, str]] = []
-        size = 0
+    pending: list[tuple[int, int, int, str]] = []  # (页, 页内起, 页内止, 文本)
+    size = 0
 
-        def flush() -> None:
-            nonlocal pending, size
-            if not pending:
-                return
-            body = "\n\n".join(f"[第 {p} 页]\n{t}" for p, t in pending)
-            tasks = _tasks_for(section.kind, body)
-            if tasks:
-                chunks.append(
-                    Chunk(
-                        page_start=pending[0][0],
-                        page_end=pending[-1][0],
-                        section_id=section.id,
-                        section_title=section.title,
-                        section_kind=section.kind,
-                        tasks=tasks,
-                        body=body,
-                    )
+    def flush() -> None:
+        nonlocal pending, size
+        if not pending:
+            return
+        body = "\n\n".join(f"[第 {p} 页]\n{t}" for p, _, _, t in pending)
+        tasks = _tasks_for(section.kind, body)
+        if tasks:
+            chunks.append(
+                Chunk(
+                    page_start=pending[0][0],
+                    page_end=pending[-1][0],
+                    section_id=section.id,
+                    section_title=section.title,
+                    section_kind=section.kind,
+                    tasks=tasks,
+                    body=body,
+                    char_start=pending[0][1],
+                    char_end=pending[-1][2],
                 )
-            pending, size = [], 0
+            )
+        pending, size = [], 0
 
-        for page in range(section.page_start, section.page_end + 1):
-            text = doc.page_text(page).strip()
-            if not text:
-                continue
-            if size + len(text) > max_chars and pending:
-                flush()
-            pending.append((page, text))
-            size += len(text)
-        flush()
+    for page in range(section.page_start, section.page_end + 1):
+        raw = doc.page_text(page)
+        lo = section.char_start if page == section.page_start else 0
+        hi = section.char_end if page == section.page_end else len(raw)
+        text = raw[lo:hi].strip()
+        if not text:
+            continue
+        if size + len(text) > max_chars and pending:
+            flush()
+        pending.append((page, lo, hi, text))
+        size += len(text)
+    flush()
     return chunks
+
+
+def build_chunks(doc: TenderDoc, max_chars: int = 3200) -> list[Chunk]:
+    out: list[Chunk] = []
+    for section in doc.sections:
+        if section.kind in EXTRACT_KINDS:
+            out.extend(_section_chunks(doc, section, max_chars))
+    return out
 
 
 # ---------------------------------------------------------------- quote 校验
@@ -210,17 +224,18 @@ def _normalized(text: str) -> tuple[str, list[int]]:
     return "".join(chars), index
 
 
-def locate_quote(page_text: str, quote: str) -> str | None:
-    """把模型给的 quote 对回原文，返回**原文里真实存在的子串**；找不到返回 None。
+def locate_quote_span(page_text: str, quote: str) -> tuple[int, int] | None:
+    """把模型给的 quote 对回原文，返回原文里的 **[start, end) 字符区间**；找不到返回 None。
 
-    先做严格子串匹配；失败再做"去空白后匹配"（PDF 抽文常把中文之间的空格吃掉/加上），
-    命中后把原文中的真实片段切回来。返回值保证是 page_text 的逐字子串。
+    返回偏移量（而不只是字符串）是为了让 _validate 能拿它跟章节的字符边界比对（P1-07）：
+    同一页上两章相邻时，光是"这页里有这句话"不足以证明这句话属于本章。
     """
     q = (quote or "").strip()
     if not q or not page_text:
         return None
-    if q in page_text:
-        return q
+    pos = page_text.find(q)
+    if pos >= 0:
+        return pos, pos + len(q)
     norm_page, index = _normalized(page_text)
     norm_q, _ = _normalized(q)
     if not norm_q:
@@ -234,11 +249,47 @@ def locate_quote(page_text: str, quote: str) -> str | None:
                 p = norm_page.find(head)
                 start = index[p]
                 end = index[p + len(head) - 1] + 1
-                return page_text[start:end]
+                return start, end
         return None
     start = index[pos]
     end = index[pos + len(norm_q) - 1] + 1
-    return page_text[start:end]
+    return start, end
+
+
+def locate_quote(page_text: str, quote: str) -> str | None:
+    """把模型给的 quote 对回原文，返回**原文里真实存在的子串**；找不到返回 None。
+
+    先做严格子串匹配；失败再做"去空白后匹配"（PDF 抽文常把中文之间的空格吃掉/加上），
+    命中后把原文中的真实片段切回来。返回值保证是 page_text 的逐字子串。
+    """
+    span = locate_quote_span(page_text, quote)
+    return page_text[span[0] : span[1]] if span else None
+
+
+def _check_quote(doc: TenderDoc, chunk: Chunk, page: int, quote: str) -> tuple[str, str]:
+    """校验一条 item 的 (page, quote)：返回 (错误原因, 原文中的真实片段)。
+
+    错误原因为空字符串表示通过。三道闸：页在块范围内 → quote 能在该页找到 →
+    定位到的区间不越过本章节的字符边界。
+    """
+    if not (chunk.page_start <= page <= chunk.page_end):
+        return f"page {page} 不在本次抽取页范围 {chunk.page_start}-{chunk.page_end}", quote
+    text = doc.page_text(page)
+    span = locate_quote_span(text, quote)
+    if span is None:
+        return f"quote 未能在第 {page} 页原文中找到", quote
+    start, end = span
+    if page == chunk.page_start and start < chunk.char_start:
+        return (
+            f"quote 起始位置 {start} 早于本章节在 p{page} 的起点 {chunk.char_start}（属于上一章节）",
+            quote,
+        )
+    if page == chunk.page_end and 0 <= chunk.char_end < end:
+        return (
+            f"quote 结束位置 {end} 超出本章节在 p{page} 的终点 {chunk.char_end}（侵入下一章节）",
+            quote,
+        )
+    return "", text[start:end]
 
 
 def _validate(doc: TenderDoc, chunk: Chunk, batch: ExtractionBatch) -> tuple[ExtractionBatch, list[str]]:
@@ -247,55 +298,49 @@ def _validate(doc: TenderDoc, chunk: Chunk, batch: ExtractionBatch) -> tuple[Ext
 
     for i, item in enumerate(batch.scoring_items):
         tag = f"scoring_items[{i}]"
-        if not (chunk.page_start <= item.page <= chunk.page_end):
-            item.mark_review(f"page {item.page} 不在本次抽取页范围 {chunk.page_start}-{chunk.page_end}")
+        err, quote = _check_quote(doc, chunk, item.page, item.quote)
+        if err:
+            item.mark_review(err)
         else:
-            found = locate_quote(doc.page_text(item.page), item.quote)
-            if found is None:
-                item.mark_review(f"quote 未能在第 {item.page} 页原文中找到")
-            else:
-                item.quote = found
+            item.quote = quote
         if item.needs_review:
             errors.extend(f"{tag} {r}" for r in item.review_reasons)
 
     for i, item in enumerate(batch.disqualifications):
         tag = f"disqualifications[{i}]"
-        if not (chunk.page_start <= item.page <= chunk.page_end):
-            item.mark_review(f"page {item.page} 不在本次抽取页范围 {chunk.page_start}-{chunk.page_end}")
+        err, quote = _check_quote(doc, chunk, item.page, item.quote)
+        if err:
+            item.mark_review(err)
         else:
-            found = locate_quote(doc.page_text(item.page), item.quote)
-            if found is None:
-                item.mark_review(f"quote 未能在第 {item.page} 页原文中找到")
-            else:
-                item.quote = found
+            item.quote = quote
         if item.needs_review:
             errors.extend(f"{tag} {r}" for r in item.review_reasons)
 
     for i, item in enumerate(batch.tech_requirements):
         tag = f"tech_requirements[{i}]"
-        pages = {item.page, item.page_end}
-        if item.page < chunk.page_start or item.page > chunk.page_end:
-            item.mark_review(f"page {item.page} 不在本次抽取页范围 {chunk.page_start}-{chunk.page_end}")
+        end_page = item.page_end or item.page
+        pages = {item.page, end_page}
+        err, quote = _check_quote(doc, chunk, item.page, item.quote)
+        if err and end_page != item.page:
+            # 跨页条目的 quote 也可能落在结束页上（起始页只写了前半句）
+            err2, quote2 = _check_quote(doc, chunk, end_page, item.quote)
+            if not err2:
+                err, quote = "", quote2
+                item.page_end = item.page
+        if err:
+            item.mark_review(err if "页范围" in err else f"quote 未能在第 {sorted(pages)} 页原文中找到：{err}")
         else:
-            found = None
-            for page in (item.page, item.page_end):
-                if chunk.page_start <= page <= chunk.page_end:
-                    found = locate_quote(doc.page_text(page), item.quote)
-                    if found:
-                        item.page, item.page_end = page, page
-                        item.quote = found
-                        break
-            if found is None:
-                item.mark_review(f"quote 未能在第 {sorted(pages)} 页原文中找到")
-            else:
-                item.quote = found
+            item.quote = quote
         if not item.section:
-            sec = doc.section_of_page(item.page)
+            sec = doc.section_at(item.page, 0)
             item.section = sec.title if sec else chunk.section_title
         if item.needs_review:
             errors.extend(f"{tag} {r}" for r in item.review_reasons)
 
+
     return batch, errors
+
+
 
 
 # ---------------------------------------------------------------- 抽取

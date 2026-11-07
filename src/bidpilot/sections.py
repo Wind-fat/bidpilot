@@ -15,6 +15,21 @@ from pathlib import Path
 
 from documind.parsing import EmptyDocumentError, Paragraph, ParsedDocument, parse_file
 
+# slice_text 需要一个 char_end；用超大值表示"取到页尾"，这样连页长都不必读 pages（P1-06）。
+PAGE_TO_END = 1 << 30
+
+
+def page_text_of(parsed: ParsedDocument, page: int) -> str:
+    """取某一页文本的唯一入口：走 documind 的 slice_text 强契约。
+
+    不要退化成 `parsed.pages[page-1]`——pages 是解析器内部的分页产物，
+    一旦 documind 改分页/清洗，直接索引会静默漂移，而 slice_text 是上游用测试钉住的那条契约
+    （ARCH-REVIEW P1-06）。
+    """
+    if not (1 <= page <= parsed.page_count):
+        return ""
+    return parsed.slice_text(page, 0, page, PAGE_TO_END)
+
 
 class TenderParseError(RuntimeError):
     """招标文件不可解析：无文本层、空文档、或解析后没有任何段落。
@@ -67,11 +82,20 @@ RE_CHAPTER = re.compile(r"^第[一二三四五六七八九十百零〇两]+章")
 
 @dataclass(slots=True)
 class Section:
+    """一个招标章节，边界精确到**页内字符偏移**（ARCH-REVIEW P1-07）。
+
+    旧实现只有页码，同一页起两章时后一章会吞掉前一章的开头
+    （end = max(start, nxt-1) 直接塌缩成同一页）。现在起点/终点都是
+    `(page, char)`：起点是本页标题段的 start，终点是本章最后一段的 end。
+    """
+
     id: str
     kind: str
     title: str
     page_start: int
+    char_start: int
     page_end: int
+    char_end: int
     paragraphs: list[Paragraph] = field(default_factory=list)
 
     @property
@@ -81,6 +105,18 @@ class Section:
     @property
     def pages(self) -> list[int]:
         return list(range(self.page_start, self.page_end + 1))
+
+    @property
+    def start(self) -> tuple[int, int]:
+        return (self.page_start, self.char_start)
+
+    @property
+    def end(self) -> tuple[int, int]:
+        return (self.page_end, self.char_end)
+
+    def contains(self, page: int, offset: int = 0) -> bool:
+        """(page, 页内偏移) 是否落在本章节区间内（闭区间，按元组比较）。"""
+        return self.start <= (page, offset) <= self.end
 
 
 @dataclass(slots=True)
@@ -106,18 +142,18 @@ class TenderDoc:
         return self.parsed.title
 
     def page_text(self, page: int) -> str:
-        if 1 <= page <= len(self.parsed.pages):
-            return self.parsed.pages[page - 1]
-        return ""
+        """页文本一律走 documind 的 slice_text（P1-06），不直接索引 parsed.pages。"""
+        return page_text_of(self.parsed, page)
 
     def by_kind(self, kind: str) -> list[Section]:
         return [s for s in self.sections if s.kind == kind]
 
+    def section_at(self, page: int, offset: int = 0) -> Section | None:
+        """定位 (页, 页内偏移) 所属章节；页内偏移缺省时按页首算。"""
+        return next((s for s in self.sections if s.contains(page, offset)), None)
+
     def section_of_page(self, page: int) -> Section | None:
-        for s in self.sections:
-            if s.page_start <= page <= s.page_end:
-                return s
-        return None
+        return self.section_at(page, 0)
 
     def outline(self) -> list[dict]:
         return self.parsed.outline()
@@ -163,30 +199,53 @@ def _dedupe_headings(doc: ParsedDocument) -> list[Paragraph]:
     return out
 
 
-def _paragraphs_in(doc: ParsedDocument, start: int, end: int) -> list[Paragraph]:
-    return [p for p in doc.paragraphs if start <= p.page <= end]
+def _paragraphs_in(
+    doc: ParsedDocument, page_start: int, char_start: int, page_end: int, char_end: int
+) -> list[Paragraph]:
+    """按 (page, 页内起始偏移) 元组比较取本章段落（闭区间）。
+
+    只比页会退化成"同页两章互相包含"，所以下界、上界都必须带字符偏移（P1-07）。
+    """
+    lo, hi = (page_start, char_start), (page_end, char_end)
+    return [p for p in doc.paragraphs if lo <= (p.page, p.start) <= hi]
+
+
+def _section_span(doc: ParsedDocument, para: Paragraph, bound: tuple[int, int] | None) -> tuple[int, int, list[Paragraph]]:
+    """从标题段开始，取到下一个标题段（开区间）为止，返回 (page_end, char_end, 段落)。"""
+    start = (para.page, para.start)
+    body = [
+        p
+        for p in doc.paragraphs
+        if start <= (p.page, p.start) and (bound is None or (p.page, p.start) < bound)
+    ]
+    if not body:
+        return para.page, para.end, []
+    return body[-1].page, body[-1].end, body
 
 
 def _fallback_sections(doc: ParsedDocument) -> list[Section]:
     """没有「第 X 章」标题的招标文件：按关键词命中的页聚合出伪章节。"""
     sections: list[Section] = []
     for kind, words in KIND_RULES:
-        pages = [i + 1 for i, page in enumerate(doc.pages) if any(w in page for w in words)]
+        pages = [i + 1 for i in range(doc.page_count) if any(w in page_text_of(doc, i + 1) for w in words)]
         if not pages:
             continue
         start, end = min(pages), max(pages)
         title = f"{KIND_LABELS[kind]}（关键词定位，无章节标题）"
+        # 关键词定位只能到页：起点页首、终点页尾
         sections.append(
             Section(
                 id=_section_id(kind, start, title),
                 kind=kind,
                 title=title,
                 page_start=start,
+                char_start=0,
                 page_end=end,
-                paragraphs=_paragraphs_in(doc, start, end),
+                char_end=len(page_text_of(doc, end)),
+                paragraphs=_paragraphs_in(doc, start, 0, end, len(page_text_of(doc, end))),
             )
         )
-    return sorted(sections, key=lambda s: s.page_start)
+    return sorted(sections, key=lambda s: (s.page_start, s.char_start))
 
 
 def build_sections(doc: ParsedDocument) -> list[Section]:
@@ -201,21 +260,20 @@ def build_sections(doc: ParsedDocument) -> list[Section]:
 
     sections: list[Section] = []
     for i, (para, kind) in enumerate(classified):
-        start = para.page
-        if i + 1 < len(classified):
-            nxt = classified[i + 1][0].page
-            end = max(start, nxt - 1) if nxt > start else start
-        else:
-            end = doc.page_count
+        # 本章上界 = 下一章标题的 (页, 偏移)，开区间；同一页起两章也不会互相吞
+        bound = (classified[i + 1][0].page, classified[i + 1][0].start) if i + 1 < len(classified) else None
+        page_end, char_end, body = _section_span(doc, para, bound)
         title = re.sub(r"\s+", " ", para.text).strip()
         sections.append(
             Section(
-                id=_section_id(kind, start, title),
+                id=_section_id(kind, para.page, title),
                 kind=kind,
                 title=title,
-                page_start=start,
-                page_end=end,
-                paragraphs=_paragraphs_in(doc, start, end),
+                page_start=para.page,
+                char_start=para.start,
+                page_end=page_end,
+                char_end=char_end,
+                paragraphs=body,
             )
         )
     return sections
@@ -228,7 +286,7 @@ def scan_disqualifications(doc: ParsedDocument, sections: list[Section]) -> list
         if len(p.text) < 8:
             continue
         if any(k in p.text for k in DISQ_KEYWORDS):
-            sec = next((s for s in sections if s.page_start <= p.page <= s.page_end), None)
+            sec = next((s for s in sections if s.contains(p.page, p.start)), None)
             hits.append(DisqHit(page=p.page, text=p.text, section_id=sec.id if sec else ""))
     return hits
 
