@@ -3,7 +3,10 @@
 *.db-wal
 *.db-shm
 .models/
-data/
+# 只忽略仓库根的 data/（运行时上传/临时数据）；src/bidpilot/data/capabilities.json 是
+# 默认能力库（示例数据），必须进仓——用裸 `data/` 会把它一起干掉，导致干净 clone 上
+# 19 个测试和整条流程都因缺文件而挂掉。
+/data/
 node_modules/
 .next/
 out/
