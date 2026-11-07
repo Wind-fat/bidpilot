@@ -19,6 +19,9 @@ name: CI
 #   └── documind/      ← 就是 ../documind 指向的位置
 #
 # 少任何一个，本 workflow 剩下的步骤都是假的。
+#
+# 动作版本：actions/checkout@v7 / astral-sh/setup-uv@v7 —— 都取「浮动 major tag」。
+# 注意 setup-uv 从 v8 起只发 vX.Y.Z 精确 tag，没有 @v8 / @v10 这种浮动 tag（会 404）。
 # ─────────────────────────────────────────────────────────────────────────────
 
 on:
@@ -50,12 +53,12 @@ jobs:
         python: ["3.12", "3.13"]
     steps:
       - name: Checkout bidpilot
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: bidpilot
 
       - name: Checkout documind（../documind，path 依赖的目标）
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: Wind-fat/documind
           path: documind
@@ -64,7 +67,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v7
         with:
           python-version: ${{ matrix.python }}
           enable-cache: true
@@ -87,12 +90,12 @@ jobs:
         working-directory: bidpilot
     steps:
       - name: Checkout bidpilot
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: bidpilot
 
       - name: Checkout documind（../documind）
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: Wind-fat/documind
           path: documind
@@ -100,7 +103,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.12"
           enable-cache: true
@@ -121,12 +124,12 @@ jobs:
         working-directory: bidpilot
     steps:
       - name: Checkout bidpilot
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: bidpilot
 
       - name: Checkout documind（../documind）
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: Wind-fat/documind
           path: documind
@@ -134,7 +137,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.12"
           enable-cache: true
