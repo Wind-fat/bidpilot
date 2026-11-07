@@ -27,7 +27,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="BidPilot P0 pipeline")
     ap.add_argument("pdf", help="招标文件 PDF 路径")
     ap.add_argument("--out-dir", default=None, help="输出目录（默认 out/）")
-    ap.add_argument("--max-chars", type=int, default=None, help="每块最大字符数（默认 3200）")
+    ap.add_argument("--max-chars", type=int, default=None, help="每块最大字符数（默认 2000，见 docs/CHUNKING.md）")
     ap.add_argument("--concurrency", type=int, default=3, help="并发 LLM 请求数")
     ap.add_argument("--no-generate", action="store_true", help="只做抽取与能力矩阵，不生成应答")
     ap.add_argument("--no-db", action="store_true", help="不写 SQLite")

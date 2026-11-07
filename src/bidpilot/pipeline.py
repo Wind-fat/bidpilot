@@ -29,9 +29,39 @@ EXIT_EXAMPLE_CAPABILITIES = 3  # 能力库是示例数据，匹配结果无商�
 EXIT_INCOMPLETE = 4  # 有章节整节失败 / 部分批次失败，交付物不完整
 EXIT_UNREADABLE = 5  # 招标文件不可解析（无文本层/空文档），未产出交付物
 
+# 严重度 → 退出码的唯一判定处（README「降级与污染标记」表必须与本表逐行一致）：
+# 4 > 2 > 3 > 0。「不完整」排第一，因为「文件里根本没有有效应答」比「有章节是模板句、
+# 但人还能逐条改」更危险；两张污染同时成立时文件名取最严重者（见 artifact_suffix）。
+INCOMPLETE_SEVERITIES = frozenset({"failed", "incomplete", "empty_delivery"})
+EXIT_PRIORITY = (EXIT_INCOMPLETE, EXIT_TEMPLATE_FALLBACK, EXIT_EXAMPLE_CAPABILITIES, EXIT_OK)
+
 log = logging.getLogger("bidpilot.pipeline")
 
 MOCK_SUFFIX = "_MOCK"
+FAILED_SUFFIX = "_FAILED"
+
+
+def exit_code_for(severities) -> int:
+    """把 problems() 的严重度集合压成一个稳定退出码；顺序即优先级（4 > 2 > 3 > 0）。"""
+    sev = set(severities)
+    if sev & INCOMPLETE_SEVERITIES:
+        return EXIT_INCOMPLETE
+    if "mocked" in sev:
+        return EXIT_TEMPLATE_FALLBACK
+    if "example_capabilities" in sev:
+        return EXIT_EXAMPLE_CAPABILITIES
+    return EXIT_OK
+
+
+def artifact_suffix(*, empty_delivery: bool, mocked: bool) -> str:
+    """文件名后缀：一个名字只能表达一种污染，取最严重者 —— `_FAILED` > `_MOCK`。
+
+    横幅可以两张同时出现（失败声明在前、模板横幅在后），但退出码与文件名必须与
+    横幅里的**最严重那条**指向同一个值，否则「三处留痕」会互相拆台。
+    """
+    if empty_delivery:
+        return FAILED_SUFFIX
+    return MOCK_SUFFIX if mocked else ""
 
 
 @dataclass(slots=True)
@@ -77,15 +107,13 @@ class PipelineResult:
 
     @property
     def exit_code(self) -> int:
-        """0 = 交付物无污染；否则按严重度给出稳定码（模板应答 > 内容不完整 > 示例库）。"""
-        sev = {p["severity"] for p in self.problems()}
-        if "mocked" in sev:
-            return EXIT_TEMPLATE_FALLBACK
-        if {"failed", "incomplete", "empty_delivery"} & sev:
-            return EXIT_INCOMPLETE
-        if "example_capabilities" in sev:
-            return EXIT_EXAMPLE_CAPABILITIES
-        return EXIT_OK
+        """0 = 交付物无污染；否则按严重度给出稳定码：4（不完整）> 2（模板应答）> 3（示例库）。"""
+        return exit_code_for(p["severity"] for p in self.problems())
+
+    @property
+    def suffix(self) -> str:
+        """落盘文件名后缀，与 exit_code 同源（`_FAILED` > `_MOCK` > 空）。"""
+        return artifact_suffix(empty_delivery=self.empty_delivery, mocked=self.workflow.mocked)
 
     def stats(self) -> dict:
         return {
@@ -118,7 +146,9 @@ def format_degradation_report(result: PipelineResult) -> list[str]:
     lines = ["交付物可信度告警（本文件不得直接提交）："]
     for p in rows:
         lines.append(f"  ! [{p['severity']}] {p['section_id']} / {p['title']}：{p['reason']}")
-    lines.append(f"  → 退出码 {result.exit_code}（2=模板应答 3=示例能力库 4=内容不完整）")
+    lines.append(
+        f"  → 退出码 {result.exit_code}（优先级 4=内容不完整 > 2=模板应答 > 3=示例能力库 > 0=干净）"
+    )
     return lines
 
 
@@ -228,10 +258,11 @@ async def run_pipeline(
     aggregated = await wf_engine.aggregate() if generate else {"doc_id": doc_id, "title": tender.title, "sections": []}
 
     # 模板降级的产物必须在文件名上就暴露，不能和真实生成的文件同名；
-    # 整节失败（没有任何通过校验的段落）则既不加 _MOCK，也不许落"看起来完整"的空壳（P0-05 延伸）
+    # 整节失败（没有任何通过校验的段落）则既不加 _MOCK，也不许落"看起来完整"的空壳（P0-05 延伸）。
+    # 两者同时成立时文件名只留最严重的一个（_FAILED），退出码同源是 4，横幅两张都在。
     sections_out = aggregated.get("sections") or []
     empty_delivery = bool(generate) and not sections_out
-    suffix = "_FAILED" if empty_delivery else (MOCK_SUFFIX if workflow.mocked else "")
+    suffix = artifact_suffix(empty_delivery=empty_delivery, mocked=workflow.mocked)
     docx_path = out / f"{Path(pdf_path).stem}_技术应答初稿{suffix}.docx"
     payload = dict(aggregated)
     if empty_delivery:

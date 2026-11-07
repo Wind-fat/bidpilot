@@ -2,7 +2,7 @@
 
 为什么必须"分段 + 校验 + 重试"：
 96 页一次塞进上下文，模型会漏条目、会把页码编错、会把 quote 改写成"摘要"。
-这里的做法是把招标文件按页窗口切成 ~3k 字符的块，每块只问它包含的那几类条目，
+这里的做法是把招标文件按页窗口切成 ~2k 字符的块（默认 2000，实测见 docs/CHUNKING.md），每块只问它包含的那几类条目，
 回来后逐条做两项硬校验：page 必须落在本块的页范围内，quote 必须能在该页原文里逐字找到。
 校验不过的条目不是删掉，而是标 needs_review 并记录原因——评审员在审核台里能看到它。
 """
@@ -205,7 +205,8 @@ def _section_chunks(doc: TenderDoc, section: Section, max_chars: int) -> list[Ch
     return chunks
 
 
-def build_chunks(doc: TenderDoc, max_chars: int = 3200) -> list[Chunk]:
+def build_chunks(doc: TenderDoc, max_chars: int = 2000) -> list[Chunk]:
+    """默认值与 Settings.chunk_max_chars 必须一致（tests/test_chunk_contract.py 钉住）。"""
     out: list[Chunk] = []
     for section in doc.sections:
         if section.kind in EXTRACT_KINDS:
@@ -583,7 +584,7 @@ async def extract(
     doc: TenderDoc,
     llm: LLM,
     *,
-    max_chars: int = 3200,
+    max_chars: int = 2000,
     max_retries: int = 2,
     concurrency: int = 3,
     cache_dir: str | Path | None = None,

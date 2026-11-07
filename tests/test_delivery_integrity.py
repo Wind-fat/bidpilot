@@ -27,12 +27,21 @@ from bidpilot.export import BANNER_EXAMPLE_CAPS, BANNER_FAILED, BANNER_MOCK, BAN
 from bidpilot.extract import ExtractResult, dump_extract
 from bidpilot.llm import FakeLLM, LLMError
 from bidpilot.pipeline import (
+    EXIT_EXAMPLE_CAPABILITIES,
     EXIT_INCOMPLETE,
+    EXIT_OK,
+    EXIT_PRIORITY,
     EXIT_TEMPLATE_FALLBACK,
+    FAILED_SUFFIX,
+    MOCK_SUFFIX,
+    PipelineResult,
+    artifact_suffix,
+    exit_code_for,
     format_degradation_report,
     run_pipeline,
 )
 from bidpilot.schemas import TechRequirement
+from bidpilot.workflow import SectionRun, WorkflowResult
 
 ROOT = Path(__file__).resolve().parents[1]
 JIANGSU = ROOT / "evals" / "datasets" / "tender_jiangsu.pdf"
@@ -325,3 +334,94 @@ def test_allow_mock_defaults_to_off(monkeypatch):
     assert Settings().allow_mock is False
     monkeypatch.setenv("BIDPILOT_ALLOW_MOCK", "1")
     assert Settings().allow_mock is True
+
+# ---------------------------------------------------------------------------
+# 退出码优先级 / 三处留痕的一致性（Q3 审计：`_MOCK` + `_FAILED` 并存时三者互相拆台）
+# ---------------------------------------------------------------------------
+
+BANNER_TO_SEVERITY = {
+    BANNER_FAILED: "empty_delivery",
+    BANNER_MOCK: "mocked",
+    BANNER_EXAMPLE_CAPS: "example_capabilities",
+}
+
+
+def _both_marks_result(tmp_path: Path) -> PipelineResult:
+    """同时具备「有章节被降级为模板应答」与「没有任何通过校验的段落」的交付物。
+
+    这个组合在 run_pipeline 的常规路径上很难同时打出来（模板段落带合法来源，通常能被
+    aggregate 收进去），所以按契约直接在 PipelineResult 这一层构造：判定函数
+    （exit_code_for / artifact_suffix）与 run_pipeline 用的是同一对函数，不是复制品。
+    """
+    return PipelineResult(
+        doc_id="d1",
+        tender=None,
+        extraction=None,
+        matches=[],
+        workflow=WorkflowResult(
+            doc_id="d1",
+            sections=[SectionRun(section_id="gen-tech", title="第四章", state="failed", mocked=True)],
+            mocked=True,
+        ),
+        aggregated={"sections": []},
+        docx_path=tmp_path / "out.docx",
+        empty_delivery=True,
+        example_capabilities=True,
+    )
+
+
+def test_incomplete_beats_mocked_in_exit_code():
+    """优先级 4 > 2 > 3 > 0：「不完整」比「有降级」更严重，压过模板应答与示例库。"""
+    assert EXIT_PRIORITY == (EXIT_INCOMPLETE, EXIT_TEMPLATE_FALLBACK, EXIT_EXAMPLE_CAPABILITIES, EXIT_OK)
+    assert exit_code_for([]) == EXIT_OK
+    assert exit_code_for(["example_capabilities"]) == EXIT_EXAMPLE_CAPABILITIES
+    assert exit_code_for(["mocked", "example_capabilities"]) == EXIT_TEMPLATE_FALLBACK
+    assert exit_code_for(["mocked", "incomplete", "example_capabilities"]) == EXIT_INCOMPLETE
+    assert exit_code_for(["empty_delivery", "mocked"]) == EXIT_INCOMPLETE
+    assert exit_code_for(["failed", "mocked"]) == EXIT_INCOMPLETE
+
+
+def test_filename_suffix_takes_the_most_severe_mark():
+    """一个文件名只能表达一种污染：`_FAILED` 压过 `_MOCK`。"""
+    assert artifact_suffix(empty_delivery=True, mocked=True) == FAILED_SUFFIX
+    assert artifact_suffix(empty_delivery=True, mocked=False) == FAILED_SUFFIX
+    assert artifact_suffix(empty_delivery=False, mocked=True) == MOCK_SUFFIX
+    assert artifact_suffix(empty_delivery=False, mocked=False) == ""
+
+
+def test_mocked_and_failed_marks_agree_on_exit_code_filename_and_first_banner(tmp_path):
+    """三处留痕必须指向同一个结论，不许「文件名说废稿、退出码说降级」。"""
+    res = _both_marks_result(tmp_path)
+    severities = {p["severity"] for p in res.problems()}
+    assert {"mocked", "empty_delivery", "example_capabilities"} <= severities
+
+    # 1) 退出码
+    assert res.exit_code == EXIT_INCOMPLETE
+    # 2) 文件名（与 PipelineResult.suffix 同源，run_pipeline 用的就是它）
+    assert res.suffix == FAILED_SUFFIX
+    assert not res.suffix.endswith(MOCK_SUFFIX), "文件名不能把废稿说成「只是降级」"
+
+    # 3) 横幅：两张都在，但第一张（最严重）必须是废稿声明
+    path = build_docx(
+        {"title": "t", "sections": [], "failures": [{"section_id": "gen-tech", "title": "第四章", "reason": "整节失败"}]},
+        tmp_path / f"x{res.suffix}.docx",
+        mocked=res.workflow.mocked,
+        example_capabilities=res.example_capabilities,
+        failed=res.empty_delivery,
+    )
+    texts = _docx_texts(path)
+    assert texts[0] == BANNER_FAILED
+    assert BANNER_MOCK in texts and BANNER_EXAMPLE_CAPS in texts, "其余污染不许被最严重那条吃掉"
+
+    # 4) 三处指向同一个结论：首段横幅的严重度 → 退出码，与 res.exit_code 一致
+    assert BANNER_TO_SEVERITY[texts[0]] in severities
+    assert exit_code_for([BANNER_TO_SEVERITY[texts[0]]]) == res.exit_code
+    assert path.name.endswith(f"{res.suffix}.docx")
+
+
+def test_readme_exit_code_contract_matches_code():
+    """README 的退出码表是给用户看的契约，优先级必须与 EXIT_PRIORITY 同向。"""
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+    assert "优先级：4 > 2 > 3 > 0" in readme, "README 的优先级必须与 pipeline.EXIT_PRIORITY 一致"
+    assert "含 `--no-generate`" not in readme, "分阶段跑不会被判成 4，README 不许再这么写"
+    assert "`--no-generate`" in readme

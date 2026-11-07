@@ -61,7 +61,9 @@ class Settings:
     allow_mock: bool = field(default_factory=lambda: _env_flag("BIDPILOT_ALLOW_MOCK", False))
 
     # ---- 抽取 ----
-    chunk_max_chars: int = field(default_factory=lambda: _env_int("BIDPILOT_CHUNK_CHARS", 3200))
+    # 2000 而不是 3200：3200 时技术章节会出现「一块 50+ 条」的超长请求（实测单块 629s、
+    # 且因个别 quote 对不上整块重来），实测分布见 docs/CHUNKING.md。
+    chunk_max_chars: int = field(default_factory=lambda: _env_int("BIDPILOT_CHUNK_CHARS", 2000))
     max_retries: int = field(default_factory=lambda: _env_int("BIDPILOT_MAX_RETRIES", 2))
     gen_batch_size: int = field(default_factory=lambda: _env_int("BIDPILOT_GEN_BATCH", 12))
 
