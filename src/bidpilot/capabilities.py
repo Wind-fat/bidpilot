@@ -12,9 +12,10 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 
-from documind import BM25Index, IndexItem, tokenize
+from documind import BM25Index, tokenize
 
 from .config import get_settings
+from .indexing import LibraryItem
 from .schemas import DisqualificationClause, ScoringItem, TechRequirement
 
 SATISFIED = "满足"
@@ -131,10 +132,10 @@ class CapabilityIndex:
     def __init__(self, caps: list[Capability]) -> None:
         self.caps = caps
         self.by_id = {c.id: c for c in caps}
-        items = [
-            IndexItem(id=c.id, text=c.text, doc_id="capabilities", strategy="capability") for c in caps
-        ]
-        self._index = BM25Index(items)
+        # 能力库不是「某份招标文件」：用 LibraryItem 明确表达「非文档来源」，
+        # 不再为每条编造 doc_id="capabilities" / strategy="capability"（P1-10）。
+        self.items = [LibraryItem(id=c.id, text=c.text) for c in caps]
+        self._index = BM25Index(self.items)
 
     @property
     def empty_library(self) -> bool:

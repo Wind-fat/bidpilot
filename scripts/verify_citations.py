@@ -6,6 +6,7 @@
         --extract-json out/jiangsu_extract.json
 
 检查项（详见 src/bidpilot/citations.py）：
+来源一致性（抽取结果记录的 source 与 --pdf 必须是同一份文件，否则直接红）→
 page 在文档范围内 → quote_span 存在且在该页范围内 → slice_text 与 quote 逐字一致 →
 quote 是该页原文子串 → section 标签与区间起点反查的章节一致。
 
@@ -22,7 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from bidpilot.citations import check_all  # noqa: E402
+from bidpilot.citations import check_all, source_mismatch  # noqa: E402
 from bidpilot.extract import load_extract  # noqa: E402
 from bidpilot.sections import TenderParseError, load_tender  # noqa: E402
 
@@ -48,11 +49,19 @@ def main() -> int:
         raise SystemExit(str(exc)) from exc
 
     res = load_extract(json.loads(payload.read_text(encoding="utf-8")))
-    report = check_all(doc, res)
 
     print("=" * 68)
     print(f"文档     ：{pdf}（{doc.page_count} 页 / {len(doc.sections)} 章）")
     print(f"抽取结果 ：{payload}")
+    # 来源一致性在逐条复核之前：拿 A 的引用去 B 里定位时，逐条结论一律不算数
+    why = source_mismatch(doc, res)
+    if why:
+        print(f"**来源不一致**：{why}")
+        print("=" * 68)
+        return 1
+    if not (res.source or "").strip():
+        print("来源     ：JSON 未记录 source（旧格式），本次跳过「同一份文档」校验")
+    report = check_all(doc, res)
     print(f"条目     ：{report.total}（{report.kind_summary()}）")
     print("-" * 68)
     print(f"**{report.summary()}**")

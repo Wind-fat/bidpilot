@@ -90,6 +90,29 @@ def check_item(doc: TenderDoc, item, kind: str = "") -> list[str]:
     return reasons
 
 
+def source_mismatch(doc: TenderDoc, res: ExtractResult) -> str | None:
+    """抽取结果自称的来源，与即将回查的文档是否同一份（P1-10 后续项）。
+
+    为什么必须有这道闸：page + quote 在**另一份**文件里也可能"偶然"命中——两份招标文件
+    的第一章、格式条款、评分表措辞高度雷同。这时 verify_citations 会报 100% 可回查，
+    但校验的根本不是那份被抽的文件：句柄指向 A，证据来自 B。
+
+    只比文件名，不做路径解析：`source` 是抽取时落盘的路径，可能是相对路径、
+    也可能来自另一平台的分隔符（`evals\\datasets\\x.pdf`）。文件名不同就一定不是同一份；
+    文件名相同但路径不同（多份同名模板）这里查不出来，交由调用方决定是否加严。
+    """
+    claimed = (res.source or "").strip().replace("\\", "/")
+    if not claimed:  # 旧 JSON 没记来源：调用方负责提示"跳过"，这里不做断言
+        return None
+    name = claimed.rsplit("/", 1)[-1]
+    if name.casefold() != doc.path.name.casefold():
+        return (
+            f"抽取结果记录的是 {name}，本次回查的是 {doc.path.name}："
+            "引用可能来自另一份文件，回查结论不算数"
+        )
+    return None
+
+
 def check_all(doc: TenderDoc, res: ExtractResult) -> CiteReport:
     """逐条复核整份抽取结果，按类型计数并收集失败明细。"""
     report = CiteReport()

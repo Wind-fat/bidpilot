@@ -196,12 +196,32 @@ def test_real_corpus_every_item_is_recheckable(real_doc, kind):
     """真实 41 页语料：重定位之后每一条都要能回查（失败明细直接进断言消息）。"""
     from pathlib import Path
 
-    payload = Path(__file__).resolve().parents[1] / "out" / "jiangsu_extract.json"
+    # 优先用入仓的测试夹具（CI 里 out/ 不存在，若只认 out/ 这条测试会静默 skip，等于没测）
+    root = Path(__file__).resolve().parents[1]
+    candidates = [root / "evals" / "fixtures" / "jiangsu_extract.json", root / "out" / "jiangsu_extract.json"]
+    payload = candidates[0] if candidates[0].exists() else candidates[1]
     if not payload.exists():
-        pytest.skip("缺少 out/jiangsu_extract.json（out/ 不入库，先跑一次抽取）")
+        pytest.skip("缺少抽取结果：evals/fixtures/jiangsu_extract.json 未入仓，且 out/ 下没有本次抽取")
     res = load_extract(json.loads(payload.read_text(encoding="utf-8")))
     relocate(real_doc, res)
 
     report = check_all(real_doc, res)
     assert report.ok == report.total, [p.line() for p in report.problems]
     assert getattr(res, kind), f"{kind} 为空，断言没有意义"
+
+
+def test_source_mismatch_catches_cross_document_verification(synthetic_doc):
+    """拿 A 的引用去 B 里定位：逐条能命中也不许算通过（P1-10 后续项）。"""
+    from bidpilot.citations import source_mismatch
+    from bidpilot.extract import ExtractResult
+
+    name = synthetic_doc.path.name
+    # 同一份文件的不同写法（裸文件名 / 相对路径 / Windows 分隔符 / 大小写）不算不一致
+    for src in (name, f"evals/datasets/{name}", f"evals\\datasets\\{name}", name.upper()):
+        assert source_mismatch(synthetic_doc, ExtractResult(title="t", source=src)) is None, src
+
+    why = source_mismatch(synthetic_doc, ExtractResult(title="t", source="evals/datasets/tender_other.pdf"))
+    assert why and "tender_other.pdf" in why and name in why, why
+
+    # 旧 JSON 没记来源：这里不做断言，由 CLI 明说「跳过」
+    assert source_mismatch(synthetic_doc, ExtractResult(title="t", source="")) is None
