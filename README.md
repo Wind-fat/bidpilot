@@ -1,5 +1,7 @@
 # BidPilot
 
+[![CI](https://github.com/Wind-fat/bidpilot/actions/workflows/ci.yml/badge.svg)](https://github.com/Wind-fat/bidpilot/actions/workflows/ci.yml)
+
 招标文件（PDF）→ 结构化抽取 → 需求-能力匹配矩阵 → 带来源的应答初稿（docx）。
 
 一条命令跑完：解析 PDF、按章节切块、逐块调用 LLM 抽取、对 quote/页码做硬校验（不合规就重试，
@@ -20,7 +22,7 @@
 ./.venv/Scripts/python.exe scripts/run_pipeline.py <pdf> --no-generate --extract-out out/x_extract.json
 ./.venv/Scripts/python.exe scripts/run_pipeline.py <pdf> --extract-json out/x_extract.json
 
-# 测试（31 个，全部离线，LLM 用 FakeLLM 注入）
+# 测试（全部离线，LLM 用 FakeLLM 注入）
 ./.venv/Scripts/python.exe -m pytest -q
 ```
 
@@ -30,6 +32,35 @@
 `--extract-out` / `--extract-json`、`BIDPILOT_GEN_BATCH`（每批生成条目数，默认 12）、
 `BIDPILOT_CACHE_DIR`（设为 `0` 关闭抽取缓存）、`BIDPILOT_LOG=INFO`。
 
+## CI：三条红线
+
+`.github/workflows/ci.yml` 在 GitHub 上跑三件事，任一红即失败：
+
+| job | 命令 | 红了意味着 |
+|---|---|---|
+| `pytest` | `uv run python -m pytest -q`（ubuntu / windows × py3.12 / py3.13） | 任何一条断言不成立，含 `tests/test_documind_contract.py`（documind 公开面契约）与真实 41 页语料的可回查测试 |
+| `ruff` | `uv run ruff check src tests scripts` | 未用导入、未定义名、导入顺序等（口径与 documind 一致） |
+| `citations` | `uv run python scripts/verify_citations.py --pdf evals/datasets/tender_jiangsu.pdf --extract-json evals/fixtures/jiangsu_extract.json` | 真实语料里有引用回查不到（page + `quote_span` 在 PDF 原文里逐字对不上），或抽取结果记录的 `source` 与 `--pdf` 不是同一份文件 |
+
+**本地等价命令**（同一份输入，不需要 GitHub）：
+
+```bash
+uv sync --frozen
+uv run python -m pytest -q
+uv run ruff check src tests scripts
+uv run python scripts/verify_citations.py \
+    --pdf evals/datasets/tender_jiangsu.pdf \
+    --extract-json evals/fixtures/jiangsu_extract.json   # 期望末行：可回查 170/170，exit 0
+```
+
+两个部署细节，改 workflow 时容易踩：
+
+- **必须 checkout 两个仓**：`pyproject.toml` 里 `documind = { path = "../documind", editable = true }`
+  是 path 依赖，CI 用 `actions/checkout` 的 `path:` 把本仓放 `bidpilot/`、documind 放 `documind/`，
+  两者成兄弟目录，`../documind` 才指得到；只 checkout 本仓则 `uv sync` 直接失败。
+- **`evals/fixtures/jiangsu_extract.json` 是测试夹具，不是产物**（`out/` 仍在 gitignore 里）。
+  它是真实 41 页语料的一次抽取快照，红线靠它可复现；说明见 `evals/fixtures/README.md`。
+
 ## 模块
 
 | 文件 | 职责 |
@@ -38,6 +69,7 @@
 | `extract.py` | 分段 → LLM → 强 schema + quote 逐字校验 → 带错误重试 → 兜底 needs_review；逐块落盘缓存 |
 | `schemas.py` | 三条硬约束：条目必须有页码+quote；quote 必须是原文子串；不合规不丢弃而是标 needs_review |
 | `capabilities.py` | 能力库 + BM25 召回 + **词面覆盖率**判定 满足/部分满足/不满足 |
+| `indexing.py` | `LibraryItem`：非文档来源（能力库/规则库）的索引条目，`doc_id` 不再编造 |
 | `workflow.py` | 显式状态机 planned→generated→citation_verified→aggregated，可只重跑某一节；大批量按批生成 |
 | `export.py` | python-docx 导出，H1=章节 / H2=招标条目，每段附来源 id + 页码 |
 | `db.py` | SQLite：条目、段落、审核动作、workflow 状态（幂等 upsert，可重跑） |

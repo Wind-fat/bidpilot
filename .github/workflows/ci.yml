@@ -1,0 +1,155 @@
+name: CI
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 为什么必须先 checkout **两个** 仓库，而不能只 checkout bidpilot：
+#
+#   bidpilot/pyproject.toml:
+#       [tool.uv.sources]
+#       documind = { path = "../documind", editable = true }
+#
+# documind 是 **path 依赖**，`uv sync` 会按相对路径去「仓库目录的父目录」找 ../documind。
+# GitHub Actions 默认把仓 checkout 到 $GITHUB_WORKSPACE 根目录，父目录既不存在也不可写，
+# 于是 `uv sync` 必定失败（failed to find directory `../documind`），后面的 pytest /
+# ruff / 引用红线一条都跑不到。
+#
+# 解法：两个仓都用 actions/checkout 的 `path:` 摆成兄弟目录 ——
+#
+#   $GITHUB_WORKSPACE/
+#   ├── bidpilot/      ← 本仓（所有 run 步骤的 working-directory）
+#   └── documind/      ← 就是 ../documind 指向的位置
+#
+# 少任何一个，本 workflow 剩下的步骤都是假的。
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: pytest / ${{ matrix.os }} / py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        # 所有命令都在 bidpilot/ 下执行：../documind 才指得到 documind 仓
+        working-directory: bidpilot
+    strategy:
+      fail-fast: false
+      matrix:
+        # pyproject 声明 requires-python = ">=3.12"：矩阵钉住下界 + 上一个次版本
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.12", "3.13"]
+    steps:
+      - name: Checkout bidpilot
+        uses: actions/checkout@v4
+        with:
+          path: bidpilot
+
+      - name: Checkout documind（../documind，path 依赖的目标）
+        uses: actions/checkout@v4
+        with:
+          repository: Wind-fat/documind
+          path: documind
+          # 公开仓：github.token 够用。私有仓：在仓里配 DOCUMIND_TOKEN（contents:read）。
+          token: ${{ secrets.DOCUMIND_TOKEN || github.token }}
+          persist-credentials: false
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+          cache-dependency-glob: bidpilot/uv.lock
+
+      - name: uv sync --frozen
+        # --frozen：CI 只消费 uv.lock，绝不在 CI 里重新解析依赖（否则 lock 形同虚设）
+        run: uv sync --frozen
+
+      - name: pytest
+        # 含 tests/test_documind_contract.py（与 documind 的公开面契约成对）
+        run: uv run python -m pytest -q
+
+  lint:
+    name: ruff
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: bidpilot
+    steps:
+      - name: Checkout bidpilot
+        uses: actions/checkout@v4
+        with:
+          path: bidpilot
+
+      - name: Checkout documind（../documind）
+        uses: actions/checkout@v4
+        with:
+          repository: Wind-fat/documind
+          path: documind
+          token: ${{ secrets.DOCUMIND_TOKEN || github.token }}
+          persist-credentials: false
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: bidpilot/uv.lock
+
+      - name: uv sync --frozen
+        run: uv sync --frozen
+
+      - name: ruff check
+        run: uv run ruff check src tests scripts
+
+  citations:
+    name: 引用可回查（红线）
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: bidpilot
+    steps:
+      - name: Checkout bidpilot
+        uses: actions/checkout@v4
+        with:
+          path: bidpilot
+
+      - name: Checkout documind（../documind）
+        uses: actions/checkout@v4
+        with:
+          repository: Wind-fat/documind
+          path: documind
+          token: ${{ secrets.DOCUMIND_TOKEN || github.token }}
+          persist-credentials: false
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: bidpilot/uv.lock
+
+      - name: uv sync --frozen
+        run: uv sync --frozen
+
+      # 红线：真实 41 页语料的每一条引用，都必须能按 page + quote_span 在 PDF 原文里
+      # 逐字找回；任何一条失败 → 脚本 exit 1 → 本 job 红。
+      # 输入是入仓的测试夹具 evals/fixtures/jiangsu_extract.json（不是产物，说明见该目录 README）；
+      # out/ 是 gitignore 的，CI 里不存在，所以不能指向它。
+      # 抽取结果若记录了 source 且与 --pdf 不是同一份文件，脚本同样 exit 1。
+      - name: verify citations (170/170 才算绿)
+        run: |
+          uv run python scripts/verify_citations.py \
+            --pdf evals/datasets/tender_jiangsu.pdf \
+            --extract-json evals/fixtures/jiangsu_extract.json

@@ -21,7 +21,9 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=8.3", "pytest-asyncio>=0.24"]
+# ruff 进 dev 组而不是只靠 `uvx ruff`：CI 要跑 `ruff check` 作为红线，
+# 版本得由 uv.lock 钉住，否则规则更新会让历史 commit 突然变红/变绿。
+dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "ruff>=0.7"]
 
 [tool.uv.sources]
 documind = { path = "../documind", editable = true }
