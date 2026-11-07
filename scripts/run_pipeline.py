@@ -19,7 +19,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from bidpilot.config import get_settings  # noqa: E402
-from bidpilot.pipeline import format_degradation_report, run_pipeline  # noqa: E402
+from bidpilot.pipeline import EXIT_UNREADABLE, format_degradation_report, run_pipeline  # noqa: E402
+from bidpilot.sections import TenderParseError  # noqa: E402
 
 
 def main() -> int:
@@ -40,19 +41,26 @@ def main() -> int:
     logging.basicConfig(level=getattr(logging, level, logging.WARNING), format="%(asctime)s %(levelname)s %(message)s")
 
     s = get_settings()
-    res = asyncio.run(
-        run_pipeline(
-            args.pdf,
-            settings=s,
-            concurrency=args.concurrency,
-            max_chars=args.max_chars,
-            generate=not args.no_generate,
-            save_db=not args.no_db,
-            out_dir=args.out_dir,
-            extract_json=args.extract_json,
-            extract_out=args.extract_out,
+    try:
+        res = asyncio.run(
+            run_pipeline(
+                args.pdf,
+                settings=s,
+                concurrency=args.concurrency,
+                max_chars=args.max_chars,
+                generate=not args.no_generate,
+                save_db=not args.no_db,
+                out_dir=args.out_dir,
+                extract_json=args.extract_json,
+                extract_out=args.extract_out,
+            )
         )
-    )
+    except TenderParseError as exc:
+        # 无文本层 / 空文档：不产出交付物，也不假装成功
+        print("=" * 68)
+        print(f"× {exc}", file=sys.stderr)
+        print(f"退出码 {EXIT_UNREADABLE}（tender_unreadable）", file=sys.stderr)
+        return EXIT_UNREADABLE
     stats = res.stats()
     ex = stats["extraction"]
 

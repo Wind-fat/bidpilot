@@ -13,7 +13,29 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from documind.parsing import Paragraph, ParsedDocument, parse_file
+from documind.parsing import EmptyDocumentError, Paragraph, ParsedDocument, parse_file
+
+
+class TenderParseError(RuntimeError):
+    """招标文件不可解析：无文本层、空文档、或解析后没有任何段落。
+
+    这是「终止流水线」级错误——不能带着空的章节树往下走，否则会产出一份
+    只有封面和目录的《技术应答初稿》并报成功（ARCH-REVIEW P0-04）。
+    """
+
+    code = "tender_unreadable"
+
+    def __init__(self, path: str | Path, detail: str = "") -> None:
+        self.path = str(path)
+        self.detail = detail
+        msg = (
+            f"无法解析招标文件：{self.path}。"
+            "该文件可能没有文本层（扫描件/图片型 PDF），请先 OCR 后再跑；"
+            "本次未生成任何交付物。"
+        )
+        if detail:
+            msg = f"{msg}（底层原因：{detail}）"
+        super().__init__(msg)
 
 # 顺序有意义：命中前面的类别就不再往后看（"采购项目技术、规格和数量要求" 应归 technical，
 # 而不是被 "采购需求" 之外的其他规则抢走）。
@@ -213,6 +235,14 @@ def scan_disqualifications(doc: ParsedDocument, sections: list[Section]) -> list
 
 def load_tender(path: str | Path) -> TenderDoc:
     p = Path(path)
-    parsed = parse_file(p)
+    try:
+        parsed = parse_file(p)
+    except EmptyDocumentError as exc:  # documind 的护栏：无文本层即抛
+        raise TenderParseError(p, str(exc)) from exc
+    if not parsed.paragraphs:
+        # 防自定义 Parser / 上游改动绕过护栏：这里再守一次
+        raise TenderParseError(p, "解析结果没有任何段落")
     sections = build_sections(parsed)
+    if not sections:
+        raise TenderParseError(p, "未识别出任何章节")
     return TenderDoc(path=p, parsed=parsed, sections=sections, disq_hits=scan_disqualifications(parsed, sections))

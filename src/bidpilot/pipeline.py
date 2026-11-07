@@ -26,6 +26,7 @@ EXIT_OK = 0
 EXIT_TEMPLATE_FALLBACK = 2  # 有章节被降级为模板应答（未调用模型）
 EXIT_EXAMPLE_CAPABILITIES = 3  # 能力库是示例数据，匹配结果无商业意义
 EXIT_INCOMPLETE = 4  # 有章节整节失败 / 部分批次失败，交付物不完整
+EXIT_UNREADABLE = 5  # 招标文件不可解析（无文本层/空文档），未产出交付物
 
 MOCK_SUFFIX = "_MOCK"
 
