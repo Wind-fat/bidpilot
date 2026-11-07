@@ -13,8 +13,8 @@
 |---|---|---|---|---|
 | C1 | **格式解析 + 结构识别**：PDF/DOCX/MD/TXT → 章/节/条 段落序列，带页码 | `parse_file(path) -> ParsedDocument`（parsing.py:343-345；后缀表 327-333） | 拿到一份招标文件的段落流，后续所有定位都基于它 | sections.py:216 `load_tender` |
 | C2 | **段落结构**：`page` / 页内 `start,end` / `level`（1=章 2=节 0=条）/ `section_path` | `ParsedDocument.paragraphs`、`Paragraph`（parsing.py:29-38, 41-46） | 章节归类（投标人须知/评标办法/技术规格…）、废标条款扫描 | sections.py:16,127-141,202-211 |
-| C3 | **页文本**：`pages[i]` 是规范化后的第 i+1 页，`page_count` | `ParsedDocument.pages` / `page_count`（parsing.py:44-54、218） | 分块正文、quote 逐字校验的**基准文本** | sections.py:86-89；extract.py:181-189,207-235 |
-| C4 | **span → 原文**：按 (页, 页内偏移) 取回原文切片 | `ParsedDocument.slice_text(page_start, char_start, page_end, char_end)`（parsing.py:56-73） | 保证"块文本 == 原文切片"，quote 与页码不会错位 | **当前未使用 —— 这是契约里最该用、却最容易被绕过的一条（ARCH-REVIEW P1-06）** |
+| C3 | **页文本**：`pages[i]` 是规范化后的第 i+1 页，`page_count` | `ParsedDocument.pages` / `page_count`（parsing.py:44-54、218） | 分块正文、quote 逐字校验的**基准文本**——但**只经 C4 读取**（`page_text_of`），不直接索引 `pages` | sections.py:18-30 `page_text_of`；extract.py:`_section_chunks`/`_check_quote` |
+| C4 | **span → 原文**：按 (页, 页内偏移) 取回原文切片 | `ParsedDocument.slice_text(page_start, char_start, page_end, char_end)`（parsing.py:56-73） | 保证"块文本 == 原文切片"，quote 与页码不会错位；也是章节字符边界的唯一读取路径 | sections.py:18-30（页文本）、extract.py:`_check_quote`（quote 区间 vs 章节区间）、tests/test_sections.py:`test_page_text_equals_slice_text` |
 | C5 | **中文词法 + BM25**：字符 bigram 分词、TF-IDF 打分、可选 `allowed` 过滤 | `tokenize(text)`、`IndexItem(id, text, …)`、`BM25Index(items).search(query, top_n, allowed=None)`（index.py:22-26, 29-41, 63-85） | 需求 ↔ 能力库的召回（不用词典、不引分词器） | capabilities.py:15,31-36,110-117 |
 
 **附加（不稳定，允许失败）**：`ParsedDocument.outline()`（parsing.py:75-86）—— 审核台的章节树展示；上游零测试，可空。
@@ -33,7 +33,7 @@
 | 后缀不在 `pdf/docx/md/txt` | parsing.py:339 抛 `ValueError` | 捕获 → 用户可见错误"仅支持 pdf/docx/md/txt"，终止流水线 | **禁止**自己用 pypdf 直读兜底（会破坏 C3/C4 的页/偏移语义） |
 | 解析成功但无文本层（扫描件） | `paragraphs == []` 或 `pages` 全空 | 视为**硬失败**：报"该文件无文本层，请先 OCR"；不建 sections、不建 chunks、不导出 | **禁止**继续跑（会产出一份只有封面+目录的 .docx 并报成功；ARCH-REVIEW P0-04 有实测） |
 | 个别页为空 | extract.py:183 已有 | 跳过该页，其余照常 | 禁止把空页当"内容缺失"整篇放弃 |
-| `slice_text` 不可用（未来版本删除） | import/属性缺失 | **fail-fast**，启动自检即报错 | 禁止退回 `"".join(pages)` —— 那正是当前 sections.py:86-89 的隐式做法 |
+| `slice_text` 不可用（未来版本删除） | import/属性缺失 | **fail-fast**，启动自检即报错 | 禁止退回 `"".join(pages)` —— 那正是 2026-11 之前 sections.py 的隐式做法（已在 P1-06 清掉） |
 | `tokenize` / `BM25Index` 不可用 | 版本不匹配 | 降级为"关键词子串匹配"，并把该次匹配的 status 一律标 `needs_review`，不允许出现"满足" | 禁止静默把 `MISSING` 当结论（当前空库与无命中同一分支，capabilities.py:121-126） |
 | `outline()` 返回空 | — | 审核台章节树显示扁平列表，不阻塞 | 禁止因此让抽取/生成失败 |
 | documind 版本不匹配 | 启动时 | 明确错误：`documind X.Y 不满足 >=0.1,<0.2，请 uv sync` | 禁止让 `ImportError` 堆栈直接冒到用户 |

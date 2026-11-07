@@ -101,7 +101,7 @@ class CapabilityLibrary:
     整份能力矩阵都不具备商业意义，必须体现在 docx 横幅与 CLI 退出码上。
     """
 
-    capabilities: list["Capability"]
+    capabilities: list[Capability]
     meta: str = ""
     is_example: bool = False
     path: Path | None = None

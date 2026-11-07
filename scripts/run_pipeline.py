@@ -88,7 +88,8 @@ def main() -> int:
         f"LLM 调用    ：共 {u['calls']} 次（抽取 {u['extract_calls']} / 生成 {u['generate_calls']}），"
         f"prompt {u['prompt_tokens']} tok / completion {u['completion_tokens']} tok"
     )
-    print(f"耗时        ：抽取 {u['extract_seconds']}s，生成 {u['generate_seconds']}s，总计 {u['total_seconds']}s")
+    print(f"耗时        ：解析+切章 {stats['timing']['parse_s']}s，抽取 {u['extract_seconds']}s，"
+          f"生成 {u['generate_seconds']}s，抽取+矩阵+导出总计 {u['total_seconds']}s（不含解析阶段）")
     flag = "**示例数据（不可作为投标依据）**" if stats["capability_library"]["is_example"] else "已配置"
     print(f"能力库      ：{flag} —— {stats['capability_library_note'][:50]}...")
 

@@ -23,7 +23,7 @@ from bidpilot.capabilities import (
     load_capabilities,
 )
 from bidpilot.config import Settings
-from bidpilot.export import BANNER_EXAMPLE_CAPS, BANNER_MOCK, build_docx
+from bidpilot.export import BANNER_EXAMPLE_CAPS, BANNER_FAILED, BANNER_MOCK, BANNER_STAGED, build_docx
 from bidpilot.extract import ExtractResult, dump_extract
 from bidpilot.llm import FakeLLM, LLMError
 from bidpilot.pipeline import (
@@ -151,7 +151,7 @@ async def test_clean_run_exits_zero_without_banners(tmp_path):
 
 @pytest.mark.skipif(not JIANGSU.exists(), reason="缺少真实招标文件样本")
 async def test_llm_down_without_explicit_mock_fails_loud(tmp_path):
-    """默认（未设 BIDPILOT_ALLOW_MOCK）时不许静默降级：章节 failed、无横幅、退出码非零。"""
+    """默认（未设 BIDPILOT_ALLOW_MOCK）时不许静默降级：章节 failed、交付物自证是废稿、退出码非零。"""
     settings = Settings(allow_mock=False, out_dir=tmp_path)
     res = await run_pipeline(
         JIANGSU,
@@ -167,9 +167,41 @@ async def test_llm_down_without_explicit_mock_fails_loud(tmp_path):
     assert res.workflow.sections, "应当有章节被规划"
     assert all(s.state == "failed" for s in res.workflow.sections)
     assert "未开启模板降级" in res.workflow.sections[0].error
-    assert res.docx_path.name.endswith("技术应答初稿.docx"), "未降级时不应有 _MOCK 后缀"
-    assert BANNER_MOCK not in _docx_texts(res.docx_path)
+    assert res.empty_delivery is True
+    assert res.docx_path.name.endswith("_FAILED.docx"), res.docx_path.name
+    assert not res.docx_path.name.endswith("_MOCK.docx")
     assert res.exit_code == EXIT_INCOMPLETE != 0
+
+
+@pytest.mark.skipif(not JIANGSU.exists(), reason="缺少真实招标文件样本")
+async def test_whole_section_failure_never_writes_an_anonymous_shell(tmp_path):
+    """整节失败时不许落"只有封面+目录、看起来完整"的空壳：文件名带 _FAILED 且首行自证（本轮修复）。"""
+    settings = Settings(allow_mock=False, out_dir=tmp_path)
+    res = await run_pipeline(
+        JIANGSU,
+        settings=settings,
+        llm=DownLLM(),
+        generate=True,
+        save_db=False,
+        out_dir=tmp_path,
+        extract_json=_extract_file(tmp_path),
+    )
+
+    # 1) 正常交付物名下的文件**不存在**（旧行为会落一份 35KB 空壳）
+    normal = tmp_path / "tender_jiangsu_技术应答初稿.docx"
+    assert not normal.exists(), "整节失败时不得落正常文件名的交付物"
+
+    # 2) 落地的文件必须在第一段就声明自己不可用
+    texts = _docx_texts(res.docx_path)
+    assert texts, "docx 不应为空文件"
+    assert texts[0] == BANNER_FAILED, f"首行必须是废稿声明，实际：{texts[:2]}"
+    assert "不得作为投标文件使用" in texts[0]
+    assert "未产出应答的章节" in texts, "失败章节清单没有写进文档"
+
+    # 3) 退出码契约不变：4 = 内容不完整
+    assert res.exit_code == EXIT_INCOMPLETE != 0
+    report = "\n".join(format_degradation_report(res))
+    assert "empty_delivery" in report or "failed" in report
 
 
 @pytest.mark.skipif(not JIANGSU.exists(), reason="缺少真实招标文件样本")
@@ -191,6 +223,9 @@ async def test_example_capability_library_banner_and_exit_code(tmp_path):
     assert BANNER_EXAMPLE_CAPS in texts
     assert BANNER_MOCK not in texts
     assert BANNER_EXAMPLE_CAPS != BANNER_MOCK
+    # --no-generate 的产物同样是空壳（只有抽取+矩阵），首行必须自证
+    assert BANNER_STAGED in texts
+    assert "未生成应答正文" in BANNER_STAGED
     assert res.exit_code == 3
 
 
@@ -221,6 +256,22 @@ def test_build_docx_renders_both_banners_independently(tmp_path):
     # 默认 kind 不刷屏，非默认 kind 才出尾注
     assert any("类型：技术响应（模板，LLM 不可用）" in t for t in mock_texts)
     assert not any(t.strip().endswith("〔类型：技术响应〕") for t in plain_texts)
+
+
+def test_build_docx_failed_puts_declaration_on_first_line(tmp_path):
+    """失败稿的单元级契约：首段就是废稿声明，后面列出逐节失败原因。"""
+    payload = {
+        "title": "t",
+        "sections": [],
+        "failures": [{"section_id": "gen-tech", "title": "第三章 采购需求", "reason": "LLM 不可用且未开启模板降级"}],
+    }
+    p = build_docx(payload, tmp_path / "f.docx", failed=True)
+    texts = _docx_texts(p)
+    assert texts[0] == BANNER_FAILED
+    assert any("gen-tech" in t and "LLM 不可用" in t for t in texts)
+    # 不传 failed 时不该出现该声明（避免把正常稿污名化）
+    plain = build_docx(payload, tmp_path / "p.docx")
+    assert BANNER_FAILED not in _docx_texts(plain)
 
 
 def test_empty_library_is_needs_review_not_missing():

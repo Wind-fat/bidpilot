@@ -34,3 +34,15 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["src"]
 filterwarnings = ["ignore::DeprecationWarning"]
+
+# 与 documind 保持同一套 lint 口径（同一批人维护两个仓库，规则不一致等于没有规则）
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+# B008: FastAPI 的 Depends 默认值写法是框架惯例；
+# UP042（(str, Enum) → StrEnum）单独一轮迁移：会改变 str() 语义，且类型检查器会把
+# StrEnum 成员推断成 Literal，波及 workflow/schemas 的全部状态比较。
+ignore = ["E501", "B008", "UP042"]

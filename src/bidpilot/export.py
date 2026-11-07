@@ -18,6 +18,10 @@ from docx.shared import Pt, RGBColor
 # 首页横幅文案：两种降级必须用**不同**措辞，评审员要能一眼分清"没调模型"和"能力库是假的"
 BANNER_MOCK = "本节为模板应答，未调用模型（LLM 不可用，已启用模板降级 BIDPILOT_ALLOW_MOCK=1）"
 BANNER_EXAMPLE_CAPS = "当前能力库为示例数据（EXAMPLE DATA），需求-能力匹配结果不具备商业意义"
+# 整节失败 / 无任何通过校验的段落：这种文件只有封面+目录，必须在第一行就自证是废稿
+BANNER_FAILED = "本文件不含任何通过校验的应答段落：生成阶段整节失败，交付物不完整，不得作为投标文件使用。"
+# 分阶段跑（--no-generate）：只有抽取+矩阵，没有应答正文，同样是空壳，必须自证
+BANNER_STAGED = "本文件只有抽取与能力矩阵结果：本次运行未生成应答正文（--no-generate），不能作为投标文件使用。"
 
 
 def _set_cn_font(document: Document, name: str = "宋体") -> None:
@@ -72,16 +76,27 @@ def build_docx(
     *,
     mocked: bool = False,
     example_capabilities: bool = False,
+    failed: bool = False,
+    staged: bool = False,
 ) -> Path:
-    """payload: {title, doc_id, sections: [{title, items, paragraphs:[{text, sources, kind}]}]}
+    """payload: {title, doc_id, sections: [{title, items, paragraphs:[{text, sources, kind}]}], failures?}
 
     `mocked` / `example_capabilities` 为真时在首页插横幅：这两种情况下的文档内容
     不能当作投标交付物，必须让打开文件的人立刻知道。
+
+    `failed` 为真表示**整份交付物没有有效内容**（生成阶段整节失败）：此时首段就是
+    废稿声明，正文里再列出失败章节——旧实现会落一份只有封面+目录的 35KB 文件，
+    打开看结构完整，只有退出码能发现问题（ARCH-REVIEW P0-05 的延伸）。
     """
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     document = Document()
     _set_cn_font(document)
+
+    if failed:
+        _add_banner(document, BANNER_FAILED, fill="FFC7CE")
+    elif staged:
+        _add_banner(document, BANNER_STAGED, fill="EDEDED")
 
     title = document.add_paragraph()
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -101,6 +116,16 @@ def build_docx(
 
     document.add_heading("目录", level=1)
     add_toc(document)
+
+    if failed:
+        document.add_heading("未产出应答的章节", level=1)
+        failures = payload.get("failures") or []
+        if not failures:
+            document.add_paragraph("（无逐节明细：生成阶段没有规划出任何章节，本文件不包含应答正文。）")
+        for f in failures:
+            document.add_paragraph(
+                f"{f.get('section_id') or '-'} / {f.get('title') or '-'}：{f.get('reason') or '未产出任何应答'}"
+            )
 
     item_by_id = {}
     for section in payload.get("sections") or []:

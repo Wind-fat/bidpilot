@@ -15,9 +15,9 @@ from pathlib import Path
 from .capabilities import CapabilityIndex, RequirementMatch, build_matrix, load_capabilities
 from .config import Settings, get_settings
 from .db import SqliteStore, init_db, make_engine, save_document, save_generation
-from .export import BANNER_EXAMPLE_CAPS, BANNER_MOCK, build_docx
+from .export import BANNER_EXAMPLE_CAPS, build_docx
 from .extract import ExtractResult, dump_extract, extract, load_extract
-from .llm import ChatClient, LLM
+from .llm import LLM, ChatClient
 from .sections import TenderDoc, load_tender
 from .workflow import MemoryStore, WorkflowEngine, WorkflowResult
 
@@ -44,13 +44,23 @@ class PipelineResult:
     capability_meta: str = ""
     example_capabilities: bool = False
     allow_mock: bool = False
+    empty_delivery: bool = False  # 生成阶段整节失败 / 没有任何通过校验的段落
     plans: list = field(default_factory=list)
     timing: dict = field(default_factory=dict)
     llm_usage: dict = field(default_factory=dict)
 
     def problems(self) -> list[dict]:
-        """交付物污染清单的汇总视图：workflow 的三个级别 + 示例能力库。"""
+        """交付物污染清单的汇总视图：workflow 的三个级别 + 空交付物 + 示例能力库。"""
         out = list(self.workflow.problems())
+        if self.empty_delivery:
+            out.append(
+                {
+                    "section_id": "delivery",
+                    "title": "交付物",
+                    "severity": "empty_delivery",
+                    "reason": "生成阶段没有产出任何通过校验的段落：文件不含有效应答，不能作为投标文件",
+                }
+            )
         if self.example_capabilities:
             out.append(
                 {
@@ -68,7 +78,7 @@ class PipelineResult:
         sev = {p["severity"] for p in self.problems()}
         if "mocked" in sev:
             return EXIT_TEMPLATE_FALLBACK
-        if {"failed", "incomplete"} & sev:
+        if {"failed", "incomplete", "empty_delivery"} & sev:
             return EXIT_INCOMPLETE
         if "example_capabilities" in sev:
             return EXIT_EXAMPLE_CAPABILITIES
@@ -88,6 +98,7 @@ class PipelineResult:
                 "problems": self.problems(),
                 "exit_code": self.exit_code,
                 "mock_allowed": self.allow_mock,
+                "empty_delivery": self.empty_delivery,
             },
             "docx": {"path": str(self.docx_path), "bytes": self.docx_bytes},
             "capability_library_note": self.capability_meta,
@@ -142,7 +153,9 @@ async def run_pipeline(
     client = llm or ChatClient(s)
     doc_id = doc_id_for(pdf_path)
 
-    tender = load_tender(pdf_path)
+    t_parse0 = time.perf_counter()
+    tender = load_tender(pdf_path)  # 解析 + 切章 + 废标扫描（200 页性能口径里的"解析+切章"）
+    parse_s = round(time.perf_counter() - t_parse0, 1)
     t_start = time.perf_counter()
     t_extract0 = t_start
     if extract_json:
@@ -202,10 +215,23 @@ async def run_pipeline(
     workflow = await wf_engine.run() if generate else WorkflowResult(doc_id=doc_id)
     aggregated = await wf_engine.aggregate() if generate else {"doc_id": doc_id, "title": tender.title, "sections": []}
 
-    # 模板降级的产物必须在文件名上就暴露，不能和真实生成的文件同名
-    suffix = MOCK_SUFFIX if workflow.mocked else ""
+    # 模板降级的产物必须在文件名上就暴露，不能和真实生成的文件同名；
+    # 整节失败（没有任何通过校验的段落）则既不加 _MOCK，也不许落"看起来完整"的空壳（P0-05 延伸）
+    sections_out = aggregated.get("sections") or []
+    empty_delivery = bool(generate) and not sections_out
+    suffix = "_FAILED" if empty_delivery else (MOCK_SUFFIX if workflow.mocked else "")
     docx_path = out / f"{Path(pdf_path).stem}_技术应答初稿{suffix}.docx"
-    build_docx(aggregated, docx_path, mocked=workflow.mocked, example_capabilities=caps_lib.is_example)
+    payload = dict(aggregated)
+    if empty_delivery:
+        payload["failures"] = [p for p in workflow.problems() if p["severity"] in ("failed", "incomplete")]
+    build_docx(
+        payload,
+        docx_path,
+        mocked=workflow.mocked,
+        example_capabilities=caps_lib.is_example,
+        failed=empty_delivery,
+        staged=not generate,
+    )
 
     if engine is not None:
         from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -255,8 +281,9 @@ async def run_pipeline(
         capability_meta=caps_lib.meta,
         example_capabilities=caps_lib.is_example,
         allow_mock=s.allow_mock,
+        empty_delivery=empty_delivery,
         plans=plans,
-        timing={"extract_s": extract_s, "generate_s": gen_s, "total_s": total_s},
+        timing={"parse_s": parse_s, "extract_s": extract_s, "generate_s": gen_s, "total_s": total_s},
         llm_usage=usage_summary,
     )
 

@@ -19,7 +19,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from .capabilities import CapabilityIndex, build_matrix, load_capabilities
+from .capabilities import CapabilityIndex, load_capabilities
 from .config import Settings, get_settings
 from .db import (
     DocumentRow,
