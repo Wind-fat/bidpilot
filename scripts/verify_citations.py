@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from bidpilot.citations import check_all, source_mismatch  # noqa: E402
-from bidpilot.extract import load_extract  # noqa: E402
+from bidpilot.extract import file_sha256, load_extract  # noqa: E402
 from bidpilot.sections import TenderParseError, load_tender  # noqa: E402
 
 
@@ -49,18 +49,23 @@ def main() -> int:
         raise SystemExit(str(exc)) from exc
 
     res = load_extract(json.loads(payload.read_text(encoding="utf-8")))
+    pdf_hash = file_sha256(pdf)
 
     print("=" * 68)
     print(f"文档     ：{pdf}（{doc.page_count} 页 / {len(doc.sections)} 章）")
     print(f"抽取结果 ：{payload}")
     # 来源一致性在逐条复核之前：拿 A 的引用去 B 里定位时，逐条结论一律不算数
-    why = source_mismatch(doc, res)
+    why = source_mismatch(doc, res, pdf_sha256=pdf_hash)
     if why:
         print(f"**来源不一致**：{why}")
         print("=" * 68)
         return 1
     if not (res.source or "").strip():
         print("来源     ：JSON 未记录 source（旧格式），本次跳过「同一份文档」校验")
+    elif res.source_sha256:
+        print(f"来源     ：内容指纹匹配（sha256 {pdf_hash[:12]}…）")
+    else:
+        print("来源     ：JSON 无内容指纹（旧格式），只做了文件名比对（弱校验）")
     report = check_all(doc, res)
     print(f"条目     ：{report.total}（{report.kind_summary()}）")
     print("-" * 68)

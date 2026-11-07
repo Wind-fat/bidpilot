@@ -117,6 +117,10 @@ class ChunkReport:
 class ExtractResult:
     title: str
     source: str
+    # 源文件内容指纹（sha256）。只在文件名比对不足时才有用：
+    # 两份招标文件常常同名不同内容（不同项目都叫「招标文件.pdf」），
+    # 只比文件名会让「拿 A 的引用去 B 里定位」在 CI 里假绿。
+    source_sha256: str = ""
     scoring_items: list[ScoringItem] = field(default_factory=list)
     disqualifications: list[DisqualificationClause] = field(default_factory=list)
     tech_requirements: list[TechRequirement] = field(default_factory=list)
@@ -481,11 +485,24 @@ def merge(res: ExtractResult) -> ExtractResult:
     return res
 
 
+def file_sha256(path: str | Path) -> str:
+    """源文件内容指纹（流式，不整份读进内存）。"""
+    h = hashlib.sha256()
+    try:
+        with Path(path).open("rb") as fh:
+            for block in iter(lambda: fh.read(1 << 20), b""):
+                h.update(block)
+    except OSError:
+        return ""
+    return h.hexdigest()
+
+
 def dump_extract(res: ExtractResult) -> dict:
     """整份抽取结果序列化（含逐块报告），用于分阶段跑：抽取一次、生成多次。"""
     return {
         "title": res.title,
         "source": res.source,
+        "source_sha256": res.source_sha256,
         "scoring_items": [i.model_dump(mode="json") for i in res.scoring_items],
         "disqualifications": [i.model_dump(mode="json") for i in res.disqualifications],
         "tech_requirements": [i.model_dump(mode="json") for i in res.tech_requirements],
@@ -500,8 +517,9 @@ def load_extract(payload: dict) -> ExtractResult:
         rep = ChunkReport(**{**r, "pages": (int(r["pages"][0]), int(r["pages"][1]))})
         reports.append(rep)
     return ExtractResult(
-        title=payload.get("title", ""),
-        source=payload.get("source", ""),
+            title=payload.get("title", ""),
+            source=payload.get("source", ""),
+            source_sha256=payload.get("source_sha256", "") or "",
         scoring_items=[ScoringItem(**i) for i in payload.get("scoring_items") or []],
         disqualifications=[DisqualificationClause(**i) for i in payload.get("disqualifications") or []],
         tech_requirements=[TechRequirement(**i) for i in payload.get("tech_requirements") or []],
@@ -572,7 +590,7 @@ async def extract(
     model: str = "",
 ) -> ExtractResult:
     """分块抽取。cache_dir 非空时逐块落盘：超时/中断后重跑直接命中已完成的块。"""
-    res = ExtractResult(title=doc.title, source=str(doc.path))
+    res = ExtractResult(title=doc.title, source=str(doc.path), source_sha256=file_sha256(doc.path))
     chunks = build_chunks(doc, max_chars=max_chars)
     cache = Path(cache_dir) if cache_dir else None
     if cache is not None:
