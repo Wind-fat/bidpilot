@@ -13,7 +13,9 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from documind.parsing import EmptyDocumentError, Paragraph, ParsedDocument, parse_file
+# 只吃 documind 的公开面（ARCH-REVIEW P0-03）。子模块 documind.parsing / documind.index
+# 属于实现细节，重命名不算 breaking —— 所以本仓 src/ 不允许直接 import 它们（有测试钉住）。
+from documind import EmptyDocumentError, Paragraph, ParsedDocument, parse_file
 
 # slice_text 需要一个 char_end；用超大值表示"取到页尾"，这样连页长都不必读 pages（P1-06）。
 PAGE_TO_END = 1 << 30

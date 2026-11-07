@@ -94,3 +94,8 @@
 - [ ] minor 内**不允许**删 `slice_text` / `parse_file` / `tokenize` / `BM25Index`
 - [ ] 新增字段必须有默认值（`Paragraph` 是 `slots=True` dataclass，位置参数已被 bidpilot 夹具依赖，见 ARCH-REVIEW P1-06）
 - [ ] 改动后跑一次 bidpilot 的 26 项测试，结果贴进 PR——**这是当前唯一的跨仓库回归闸门**
+## 4.1 公开面最终口径（2026-11-07，主控裁定）
+
+- documind 的 `__all__` 取 **7 个名字**：`parse_file`、`ParsedDocument`、`Paragraph`、`EmptyDocumentError`、`tokenize`、`IndexItem`、`BM25Index`。
+- 比 §1 的「五个能力」多两个，因为 C1 的失败侧（`EmptyDocumentError`）与 C5 的索引项类型（`IndexItem`）都是下游真实要用的类型，收敛到 5 个会把 bidpilot 逼回子模块 import，等于边界没做。
+- 仓内校验：`bidpilot/tests/test_documind_contract.py::test_product_code_never_imports_submodules` 会红掉 `src/` 里任何一处子模块 import。

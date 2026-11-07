@@ -12,7 +12,7 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 
-from documind.index import BM25Index, IndexItem, tokenize
+from documind import BM25Index, IndexItem, tokenize
 
 from .config import get_settings
 from .schemas import DisqualificationClause, ScoringItem, TechRequirement
