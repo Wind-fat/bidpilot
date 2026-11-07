@@ -28,6 +28,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from pypdf import PdfReader  # noqa: E402
 
+from bidpilot.extract import build_chunks  # noqa: E402
 from bidpilot.pipeline import run_pipeline  # noqa: E402
 from bidpilot.sections import build_sections, load_tender, scan_disqualifications  # noqa: E402
 
@@ -94,6 +95,11 @@ def main() -> int:
     ap.add_argument("--pages", type=int, default=200)
     ap.add_argument("--out-dir", default=str(ROOT / "out" / "perf"))
     ap.add_argument("--repeat", type=int, default=1, help="重复跑几次取最好成绩")
+    ap.add_argument(
+        "--no-relocate",
+        action="store_true",
+        help="不复用抽取结果里的 quote 重新定位（抽取 JSON 来自另一份语料时必须关，否则会被判 needs_review）",
+    )
     args = ap.parse_args()
 
     src = Path(args.pdf)
@@ -105,11 +111,17 @@ def main() -> int:
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    big = out_dir / f"tender_{args.pages}p.pdf"
+    big = out_dir / f"tender_{args.pages}p.pdf" if src.suffix.lower() == ".pdf" else src
 
+    # 源可以是 PDF（循环拼页）也可以是 documind 直接吃的 md/txt 长语料（原样测）。
+    is_pdf = src.suffix.lower() == ".pdf"
     t0 = time.perf_counter()
-    build_pdf(src, big, args.pages)
+    if is_pdf:
+        build_pdf(src, big, args.pages)
+    else:
+        big = src
     build_s = round(time.perf_counter() - t0, 2)
+    relocate = is_pdf and not args.no_relocate
 
     runs = []
     for _ in range(max(1, args.repeat)):
@@ -125,6 +137,11 @@ def main() -> int:
         hits = scan_disqualifications(doc.parsed, sections)
         scan_s = round(time.perf_counter() - t_scan, 3)
 
+        # 切章之后立刻要按章分块喂模型：章节数放大后真正会涨的是这一段（只算切块，不调 LLM）
+        t_chunk = time.perf_counter()
+        chunks = build_chunks(doc)
+        chunk_s = round(time.perf_counter() - t_chunk, 3)
+
         t2 = time.perf_counter()
         res = asyncio.run(
             run_pipeline(
@@ -133,6 +150,7 @@ def main() -> int:
                 save_db=False,
                 out_dir=out_dir,
                 extract_json=extract,
+                relocate_spans=relocate,
             )
         )
         pipeline_s = round(time.perf_counter() - t2, 2)
@@ -141,6 +159,8 @@ def main() -> int:
                 "parse_s": parse_s,
                 "build_sections_s": build_sections_s,
                 "scan_disq_s": scan_s,
+                "build_chunks_s": chunk_s,
+                "chunks": len(chunks),
                 "pipeline_wall_s": pipeline_s,
                 "pipeline_internal": dict(res.timing),
                 "pages": doc.page_count,
@@ -158,7 +178,8 @@ def main() -> int:
     single_pass_total = round(best["parse_s"] + best["pipeline_internal"]["total_s"], 2)
     report = {
         "source_pdf": str(src),
-        "source_pages": len(PdfReader(str(src)).pages),
+        "source_pages": len(PdfReader(str(src)).pages) if is_pdf else None,
+        "relocate": relocate,
         "built_pdf": str(big),
         "built_pages": best["pages"],
         "built_bytes": big.stat().st_size,
@@ -176,17 +197,21 @@ def main() -> int:
     (out_dir / "bench_200p.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print("=" * 68)
-    print(f"拼接 PDF   ：{big}  {best['pages']} 页 / {report['built_bytes']} bytes（源 {report['source_pages']} 页 × "
-          f"{best['pages'] / report['source_pages']:.2f} 循环）")
+    if is_pdf:
+        print(f"拼接 PDF   ：{big}  {best['pages']} 页 / {report['built_bytes']} bytes（源 {report['source_pages']} 页 × "
+              f"{best['pages'] / report['source_pages']:.2f} 循环）")
+    else:
+        print(f"长语料     ：{big}  {best['pages']} 页 / {report['built_bytes']} bytes（原样测，不拼页）")
     print(f"机器       ：{report['machine']['processor'] or report['machine']['machine']} / "
           f"{report['machine']['cpu_count']} 核 / {report['machine']['ram_gb']} GB RAM / "
           f"Python {report['machine']['python']}")
     print("-" * 68)
     for i, r in enumerate(runs, 1):
-        print(f"第 {i} 次     ：解析+切章 {r['parse_s']}s（其中切章 {r['build_sections_s']}s / 废标扫描 {r['scan_disq_s']}s）"
+        print(f"第 {i} 次     ：解析+切章 {r['parse_s']}s（其中切章 {r['build_sections_s']}s / 废标扫描 {r['scan_disq_s']}s"
+              f" / 分块 {r['build_chunks_s']}s）"
               f" | 抽取+矩阵+导出 {r['pipeline_internal']['total_s']}s "
               f"| 单次全流程 {round(r['parse_s'] + r['pipeline_internal']['total_s'], 2)}s "
-              f"| 段落 {r['paragraphs']} / 章节 {r['sections']} / 废标命中 {r['disq_hits']}"
+              f"| 段落 {r['paragraphs']} / 章节 {r['sections']} / 分块 {r['chunks']} / 废标命中 {r['disq_hits']}"
               f" | LLM 调用 {r['llm_calls']} | 退出码 {r['exit_code']}")
     print("-" * 68)
     print(f"最好成绩   ：解析+切章 {best['parse_s']}s + 其余 {best['pipeline_internal']['total_s']}s "

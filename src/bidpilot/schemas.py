@@ -51,7 +51,56 @@ class _Base(BaseModel):
             self.review_reasons.append(reason)
 
 
-class ScoringItem(_Base):
+class _Located(_Base):
+    """带**原文证据区间**的条目（ARCH-REVIEW 引用定位精度）。
+
+    `quote_span = (页, 页内起, 页内止)` 是 quote 在原文里的位置，由 `extract` 定位后回填，
+    **不采信模型自报**（模型给的会被定位结果覆盖）。它和 `page`/`page_end` 是两个概念：
+    page..page_end 是条目声称的跨度，quote_span 是这段话真正的落点；跨页条目的 quote 可能
+    只落在结束页上，靠一个三元组把「哪一页」一并钉死，才不会出现「页码说 A 页、偏移算 B 页」。
+
+    有了它，章节标签才能按 `section_at(页, 页内起)` 定位，而不是把整页都算成页首那一章。
+    """
+
+    quote_span: tuple[int, int, int] | None = None
+    # 章级标签：由 quote_span 的起点反查章节，抽取/回填阶段覆写，不接受模型自报
+    section: str = ""
+
+    @field_validator("quote_span", mode="before")
+    @classmethod
+    def _span(cls, v):
+        """只接受三元组；形状不对就当没给（真值一律由定位阶段写入，见 extract._stamp）。"""
+        if v in (None, ""):
+            return None
+        if isinstance(v, (list, tuple)) and len(v) == 3:
+            try:
+                page, start, end = (int(x) for x in v)
+            except (TypeError, ValueError):
+                return None
+            if page >= 1 and 0 <= start < end:
+                return (page, start, end)
+        return None
+
+    @field_validator("section", mode="before")
+    @classmethod
+    def _section(cls, v):
+        return "" if v is None else str(v)
+
+    @property
+    def char_offset(self) -> int | None:
+        """页内起始偏移的便捷读法（只读；写入请用 quote_span）。"""
+        return self.quote_span[1] if self.quote_span else None
+
+    def check_span_in_pages(self) -> None:
+        """证据页必须落在条目自己声称的 page..page_end 里（跨页条目的 quote 可能只在结束页）。"""
+        if not self.quote_span:
+            return
+        claimed = {getattr(self, "page", None), getattr(self, "page_end", None)}
+        if self.quote_span[0] not in claimed:
+            self.mark_review(f"quote_span 落在 p{self.quote_span[0]}，不在 page..page_end 内")
+
+
+class ScoringItem(_Located):
     """评分项。no 是评分表里的编号（如 "2.1"），item 是评分因素，criteria_text 是评审标准原文。"""
 
     no: str = ""
@@ -93,10 +142,11 @@ class ScoringItem(_Base):
                 self.mark_review(f"{name} 为空")
         if self.max_score is None:
             self.mark_review("max_score 未解析出分值")
+        self.check_span_in_pages()
         return self
 
 
-class DisqualificationClause(_Base):
+class DisqualificationClause(_Located):
     """废标/无效投标条款。category 四分类之外还有 报价，共 5 类。"""
 
     clause_text: str
@@ -134,10 +184,11 @@ class DisqualificationClause(_Base):
             self.mark_review("clause_text 为空")
         if not self.quote.strip():
             self.mark_review("quote 为空")
+        self.check_span_in_pages()
         return self
 
 
-class TechRequirement(_Base):
+class TechRequirement(_Located):
     """技术要求条目。page..page_end 允许跨页，quote 必须能在 page（必要时 page_end）里找到。"""
 
     no: str = ""
@@ -145,7 +196,6 @@ class TechRequirement(_Base):
     page: int
     page_end: int | None = None
     quote: str
-    section: str = ""
 
     @field_validator("no", mode="before")
     @classmethod
@@ -157,7 +207,7 @@ class TechRequirement(_Base):
     def _page(cls, v):
         return None if v in (None, "") else _coerce_page(v)
 
-    @field_validator("text", "quote", "section", mode="before")
+    @field_validator("text", "quote", mode="before")
     @classmethod
     def _text(cls, v):
         return "" if v is None else str(v)
@@ -173,6 +223,7 @@ class TechRequirement(_Base):
             self.mark_review("text 为空")
         if not self.quote.strip():
             self.mark_review("quote 为空")
+        self.check_span_in_pages()
         return self
 
 

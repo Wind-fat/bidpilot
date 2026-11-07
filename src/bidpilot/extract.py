@@ -61,7 +61,6 @@ TASK_SPECS: dict[str, str] = {
         "- page: quote 起始页码（整数）\n"
         "- page_end: quote 结束页码（整数，同一页就与 page 相同）\n"
         "- quote: 从原文逐字复制的片段（≤300 字）；跨页时可只复制起始页的片段\n"
-        "- section: 该条所属小节名（尽力而为，没有就留空字符串）\n"
     ),
 }
 
@@ -266,81 +265,113 @@ def locate_quote(page_text: str, quote: str) -> str | None:
     return page_text[span[0] : span[1]] if span else None
 
 
-def _check_quote(doc: TenderDoc, chunk: Chunk, page: int, quote: str) -> tuple[str, str]:
-    """校验一条 item 的 (page, quote)：返回 (错误原因, 原文中的真实片段)。
+def _check_quote(
+    doc: TenderDoc, chunk: Chunk, page: int, quote: str
+) -> tuple[str, str, tuple[int, int, int] | None]:
+    """校验一条 item 的 (page, quote)：返回 (错误原因, 原文中的真实片段, 证据区间)。
 
-    错误原因为空字符串表示通过。三道闸：页在块范围内 → quote 能在该页找到 →
-    定位到的区间不越过本章节的字符边界。
+    错误原因为空字符串表示通过。四道闸：页在文档/块范围内 → quote 能在该页找到 →
+    定位区间不越出页长 → 定位到的区间不越过本章节的字符边界。
+    第三、四个返回值是给 `quote_span` 用的：区间带页号，跨页条目也不会把「哪一页」弄丢。
     """
+    if not (1 <= page <= doc.page_count):
+        return f"page {page} 超出文档页范围 1-{doc.page_count}", quote, None
     if not (chunk.page_start <= page <= chunk.page_end):
-        return f"page {page} 不在本次抽取页范围 {chunk.page_start}-{chunk.page_end}", quote
+        return f"page {page} 不在本次抽取页范围 {chunk.page_start}-{chunk.page_end}", quote, None
     text = doc.page_text(page)
     span = locate_quote_span(text, quote)
     if span is None:
-        return f"quote 未能在第 {page} 页原文中找到", quote
+        return f"quote 未能在第 {page} 页原文中找到", quote, None
     start, end = span
+    if not (0 <= start < end <= len(text)):
+        return f"定位区间 [{start},{end}) 越出第 {page} 页（页长 {len(text)}）", quote, None
     if page == chunk.page_start and start < chunk.char_start:
         return (
             f"quote 起始位置 {start} 早于本章节在 p{page} 的起点 {chunk.char_start}（属于上一章节）",
             quote,
+            None,
         )
     if page == chunk.page_end and 0 <= chunk.char_end < end:
         return (
             f"quote 结束位置 {end} 超出本章节在 p{page} 的终点 {chunk.char_end}（侵入下一章节）",
             quote,
+            None,
         )
-    return "", text[start:end]
+    return "", text[start:end], (page, start, end)
+
+
+def _stamp(item, span: tuple[int, int, int], fragment: str) -> None:
+    """把定位结果写回条目：quote 换成原文真实片段，quote_span 记证据区间。
+
+    quote_span 一律由定位算出，**模型自报的同名/偏移字段直接覆盖**——它没法核验，
+    而章节标签、可回查率都要拿它当依据。
+    """
+    item.quote = fragment
+    item.quote_span = span
+
+
+def _label_chapter(doc: TenderDoc, item, page: int, offset: int, fallback: str = "") -> str:
+    """按**页内偏移**反查章级标签；页首那一段可能是上一章（同页跟章）。
+
+    旧实现 (page, 0) 会让页尾条目全落到上一章的标题上：41 页真实语料里 21/170 条受影响
+    （见 docs/LOCATE.md）。定位不到章节（封面/目录页）时退回本块所属章节标题，不瞎猜。
+    """
+    sec = doc.section_at(page, offset)
+    item.section = sec.title if sec else fallback
+    return item.section
 
 
 def _validate(doc: TenderDoc, chunk: Chunk, batch: ExtractionBatch) -> tuple[ExtractionBatch, list[str]]:
-    """就地修正/标记，返回 (batch, 错误列表)。错误列表非空 → 触发重试。"""
+    """就地修正/标记，返回 (batch, 错误列表)。错误列表非空 → 触发重试。
+
+    每条通过校验的条目都拿到两样可回查的东西：
+    - `quote` 换成原文里的逐字片段（引用锚点）；
+    - `quote_span`（页, 页内起, 页内止）与 `section`（按**区间起点**反查的章级标签）。
+    """
     errors: list[str] = []
 
     for i, item in enumerate(batch.scoring_items):
-        tag = f"scoring_items[{i}]"
-        err, quote = _check_quote(doc, chunk, item.page, item.quote)
-        if err:
-            item.mark_review(err)
-        else:
-            item.quote = quote
-        if item.needs_review:
-            errors.extend(f"{tag} {r}" for r in item.review_reasons)
+        _validate_one(doc, chunk, item, f"scoring_items[{i}]", errors)
 
     for i, item in enumerate(batch.disqualifications):
-        tag = f"disqualifications[{i}]"
-        err, quote = _check_quote(doc, chunk, item.page, item.quote)
-        if err:
-            item.mark_review(err)
-        else:
-            item.quote = quote
-        if item.needs_review:
-            errors.extend(f"{tag} {r}" for r in item.review_reasons)
+        _validate_one(doc, chunk, item, f"disqualifications[{i}]", errors)
 
     for i, item in enumerate(batch.tech_requirements):
-        tag = f"tech_requirements[{i}]"
-        end_page = item.page_end or item.page
-        pages = {item.page, end_page}
-        err, quote = _check_quote(doc, chunk, item.page, item.quote)
-        if err and end_page != item.page:
-            # 跨页条目的 quote 也可能落在结束页上（起始页只写了前半句）
-            err2, quote2 = _check_quote(doc, chunk, end_page, item.quote)
-            if not err2:
-                err, quote = "", quote2
-                item.page_end = item.page
-        if err:
-            item.mark_review(err if "页范围" in err else f"quote 未能在第 {sorted(pages)} 页原文中找到：{err}")
-        else:
-            item.quote = quote
-        if not item.section:
-            sec = doc.section_at(item.page, 0)
-            item.section = sec.title if sec else chunk.section_title
-        if item.needs_review:
-            errors.extend(f"{tag} {r}" for r in item.review_reasons)
-
+        _validate_tech(doc, chunk, item, f"tech_requirements[{i}]", errors)
 
     return batch, errors
 
 
+def _validate_one(doc: TenderDoc, chunk: Chunk, item, tag: str, errors: list[str]) -> None:
+    """单页条目（评分项 / 废标条款）：定位 → 写回 → 打章节标签。"""
+    err, quote, span = _check_quote(doc, chunk, item.page, item.quote)
+    if err:
+        item.mark_review(err)
+    else:
+        _stamp(item, span, quote)
+        _label_chapter(doc, item, span[0], span[1], chunk.section_title)
+    if item.needs_review:
+        errors.extend(f"{tag} {r}" for r in item.review_reasons)
+
+
+def _validate_tech(doc: TenderDoc, chunk: Chunk, item, tag: str, errors: list[str]) -> None:
+    """跨页条目：先按起始页定位，失败再试结束页；quote_span 记的是**证据页**。"""
+    end_page = item.page_end or item.page
+    pages = sorted({item.page, end_page})
+    err, quote, span = _check_quote(doc, chunk, item.page, item.quote)
+    if err and end_page != item.page:
+        # 跨页条目的 quote 也可能落在结束页上（起始页只写了前半句）；page/page_end 保持原样，
+        # 证据落在哪一页由 quote_span 的第一位说清楚，不再把 page_end 塌成 page。
+        err2, quote2, span2 = _check_quote(doc, chunk, end_page, item.quote)
+        if not err2:
+            err, quote, span = "", quote2, span2
+    if err:
+        item.mark_review(err if "页范围" in err else f"quote 未能在第 {pages} 页原文中找到：{err}")
+    else:
+        _stamp(item, span, quote)
+        _label_chapter(doc, item, span[0], span[1], chunk.section_title)
+    if item.needs_review:
+        errors.extend(f"{tag} {r}" for r in item.review_reasons)
 
 
 # ---------------------------------------------------------------- 抽取
@@ -477,6 +508,52 @@ def load_extract(payload: dict) -> ExtractResult:
         reports=reports,
         usage=payload.get("usage") or {},
     )
+
+
+def _locate_for_item(doc: TenderDoc, item) -> tuple[int, int, int] | None:
+    """按 page（跨页条目再试 page_end）重新定位 quote，返回 (页, 起, 止)。"""
+    pages = [item.page]
+    end_page = getattr(item, "page_end", None)
+    if end_page and end_page != item.page:
+        pages.append(end_page)
+    for page in pages:
+        if not (1 <= page <= doc.page_count):
+            continue
+        text = doc.page_text(page)
+        span = locate_quote_span(text, item.quote)
+        if span is None:
+            continue
+        start, end = span
+        if 0 <= start < end <= len(text):
+            return (page, start, end)
+    return None
+
+
+def relocate(doc: TenderDoc, res: ExtractResult) -> dict:
+    """给**已落盘**的抽取结果补回定位：quote_span + 章级 section。不调 LLM、不改条目集合。
+
+    分阶段跑（`--extract-json`）时，JSON 可能是旧版条目（没有 quote_span），也可能来自
+    另一份文档；这里按 page + quote 重新定位，**定位不到就标 needs_review 并进明细**，
+    只加严不放宽：不猜偏移、不删条目、不把"找不到"当成"通过"。
+    """
+    stats = {"items": len(res.items()), "located": 0, "unlocated": []}
+    for item in res.items():
+        span = _locate_for_item(doc, item)
+        if span is None:
+            page = item.page
+            why = (
+                f"page {page} 超出文档页范围 1-{doc.page_count}"
+                if not (1 <= page <= doc.page_count)
+                else f"quote 未能在第 {page} 页原文中找到"
+            )
+            item.mark_review(why)
+            stats["unlocated"].append({"id": item.id, "page": page, "reason": why})
+            continue
+        page, start, end = span
+        _stamp(item, span, doc.page_text(page)[start:end])
+        _label_chapter(doc, item, page, start, "")
+        stats["located"] += 1
+    return stats
 
 
 def _cache_file(cache_dir: Path, chunk: Chunk, model: str) -> Path:

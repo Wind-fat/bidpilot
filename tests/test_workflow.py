@@ -142,11 +142,32 @@ def test_build_plan_groups_by_chapter_when_available():
         TechRequirement(id="T002", no="2", text="b", page=3, page_end=3, quote="b", section="桌子"),
     ]
     matches = build_matrix(res.tech_requirements, res.scoring_items, res.disqualifications, CapabilityIndex(caps))
-    by_section = build_plan("d", res, matches, chapter_of=lambda p: "第四章 技术需求")
+    by_section = build_plan("d", res, matches, chapter_of=lambda p, o=0: "第四章 技术需求")
     by_item = build_plan("d", res, matches)
 
     assert len(by_section) == 1 and by_section[0].item_ids == ["T001", "T002"]
     assert len(by_item) == 2  # 没有章节映射时退回条目自带的 section
+
+
+def test_build_plan_passes_quote_offset_to_chapter_of():
+    """同页跟章：给的是 quote 的页内起点，不是 0（否则页尾条目会归到上一章）。"""
+    caps = load_capabilities().capabilities
+    res = ExtractResult(title="t", source="s")
+    res.tech_requirements = [
+        TechRequirement(id="T001", no="1", text="a", page=13, page_end=13, quote="a", quote_span=[13, 420, 421]),
+        TechRequirement(id="T002", no="2", text="b", page=13, page_end=13, quote="b", quote_span=[13, 30, 31]),
+    ]
+    matches = build_matrix(res.tech_requirements, res.scoring_items, res.disqualifications, CapabilityIndex(caps))
+    seen: list[tuple[int, int]] = []
+
+    def chapter_of(page, offset=0):
+        seen.append((page, offset))
+        return "甲章" if offset >= 100 else "乙章"
+
+    plans = build_plan("d", res, matches, chapter_of=chapter_of)
+    assert seen == [(13, 420), (13, 30)]
+    assert {p.title for p in plans} == {"甲章", "乙章"}
+    assert {p.item_ids[0] for p in plans} == {"T001", "T002"}
 
 
 async def test_large_section_is_generated_in_batches():

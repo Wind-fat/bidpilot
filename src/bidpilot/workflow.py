@@ -164,12 +164,14 @@ def build_plan(
 ) -> list[PlannedSection]:
     """按章节组织生成计划。
 
-    chapter_of(page) 给出该页所属的招标文件章节；有它时按**章节**聚合（一份标书通常 4-6 章，
-    而不是模型的 30+ 个表格小节），没有时退回条目自带的 section。
+    chapter_of(page, offset) 给出该条引用**落点**所属的招标文件章节（offset 是 quote 的页内起点，
+    同页跟章时页首那一段可能属于上一章）；有它时按**章节**聚合（一份标书通常 4-6 章，而不是
+    模型的 30+ 个表格小节），没有时退回条目自带的 section。
     """
     by_section: dict[str, list] = {}
     for t in result.tech_requirements:
-        key = (chapter_of(t.page) if chapter_of else "") or t.section or "技术要求"
+        offset = t.char_offset or 0
+        key = (chapter_of(t.page, offset) if chapter_of else "") or t.section or "技术要求"
         by_section.setdefault(key, []).append(t)
     match_by_req = {m.requirement_id: m for m in matches}
     plans: list[PlannedSection] = []

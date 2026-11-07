@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,7 +17,7 @@ from .capabilities import CapabilityIndex, RequirementMatch, build_matrix, load_
 from .config import Settings, get_settings
 from .db import SqliteStore, init_db, make_engine, save_document, save_generation
 from .export import BANNER_EXAMPLE_CAPS, build_docx
-from .extract import ExtractResult, dump_extract, extract, load_extract
+from .extract import ExtractResult, dump_extract, extract, load_extract, relocate
 from .llm import LLM, ChatClient
 from .sections import TenderDoc, load_tender
 from .workflow import MemoryStore, WorkflowEngine, WorkflowResult
@@ -27,6 +28,8 @@ EXIT_TEMPLATE_FALLBACK = 2  # 有章节被降级为模板应答（未调用模�
 EXIT_EXAMPLE_CAPABILITIES = 3  # 能力库是示例数据，匹配结果无商业意义
 EXIT_INCOMPLETE = 4  # 有章节整节失败 / 部分批次失败，交付物不完整
 EXIT_UNREADABLE = 5  # 招标文件不可解析（无文本层/空文档），未产出交付物
+
+log = logging.getLogger("bidpilot.pipeline")
 
 MOCK_SUFFIX = "_MOCK"
 
@@ -144,6 +147,7 @@ async def run_pipeline(
     out_dir: str | Path | None = None,
     extract_json: str | Path | None = None,
     extract_out: str | Path | None = None,
+    relocate_spans: bool = True,
 ) -> PipelineResult:
     s = settings or get_settings()
     s.ensure_dirs()
@@ -158,9 +162,16 @@ async def run_pipeline(
     parse_s = round(time.perf_counter() - t_parse0, 1)
     t_start = time.perf_counter()
     t_extract0 = t_start
+    reloc = {"items": 0, "located": 0, "unlocated": []}
     if extract_json:
         # 分阶段跑：复用已落盘的抽取结果，不再调 LLM
         extraction = load_extract(json.loads(Path(extract_json).read_text(encoding="utf-8")))
+        if relocate_spans:
+            # 旧版 JSON 没有 quote_span；按 page+quote 重定位后才谈得上「章节标签 / 可回查」。
+            # 定位不到只加 needs_review，不猜偏移（见 docs/LOCATE.md）。
+            reloc = relocate(tender, extraction)
+            if reloc["unlocated"]:
+                log.warning("重定位失败 %d 条（已标 needs_review）", len(reloc["unlocated"]))
     else:
         extraction = await extract(
             tender,
@@ -196,8 +207,9 @@ async def run_pipeline(
 
         store = SqliteStore(async_sessionmaker(engine, expire_on_commit=False))  # type: ignore[assignment]
 
-    def _chapter_of(page: int) -> str:
-        sec = tender.section_of_page(page)
+    def _chapter_of(page: int, offset: int = 0) -> str:
+        """按引用落点（页 + 页内偏移）取章节，而不是整页都算页首那一章。"""
+        sec = tender.section_at(page, offset)
         return sec.title if sec else ""
 
     wf_engine = WorkflowEngine(
@@ -261,6 +273,8 @@ async def run_pipeline(
             "extract_completion_tokens": tok_after_extract[1],
             "generate_prompt_tokens": usage_summary["prompt_tokens"] - tok_after_extract[0],
             "generate_completion_tokens": usage_summary["completion_tokens"] - tok_after_extract[1],
+            "relocated": reloc["located"],
+            "relocate_unlocated": len(reloc["unlocated"]),
             "extract_attempts": sum(r.attempts for r in extraction.reports),
             "chunks": len(extraction.reports),
             "extract_seconds": extract_s,
