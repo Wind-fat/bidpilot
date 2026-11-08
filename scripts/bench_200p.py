@@ -113,10 +113,12 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     big = out_dir / f"tender_{args.pages}p.pdf" if src.suffix.lower() == ".pdf" else src
 
-    # 源可以是 PDF（循环拼页）也可以是 documind 直接吃的 md/txt 长语料（原样测）。
+    # 源可以是 PDF（不足 pages 页则循环拼页；已够页则原样测，
+    # 免得把 204 页的 26 章语料截成 200 页），也可以是 documind 直接吃的 md/txt 长语料（原样测）。
     is_pdf = src.suffix.lower() == ".pdf"
+    src_pages = len(PdfReader(str(src)).pages) if is_pdf else 0
     t0 = time.perf_counter()
-    if is_pdf:
+    if is_pdf and src_pages < args.pages:
         build_pdf(src, big, args.pages)
     else:
         big = src
@@ -178,7 +180,7 @@ def main() -> int:
     single_pass_total = round(best["parse_s"] + best["pipeline_internal"]["total_s"], 2)
     report = {
         "source_pdf": str(src),
-        "source_pages": len(PdfReader(str(src)).pages) if is_pdf else None,
+        "source_pages": src_pages or None,
         "relocate": relocate,
         "built_pdf": str(big),
         "built_pages": best["pages"],
@@ -197,9 +199,12 @@ def main() -> int:
     (out_dir / "bench_200p.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print("=" * 68)
-    if is_pdf:
+    if is_pdf and src_pages < args.pages:
         print(f"拼接 PDF   ：{big}  {best['pages']} 页 / {report['built_bytes']} bytes（源 {report['source_pages']} 页 × "
               f"{best['pages'] / report['source_pages']:.2f} 循环）")
+    elif is_pdf:
+        print(f"真 PDF     ：{big}  {best['pages']} 页 / {report['built_bytes']} bytes（源 {report['source_pages']} 页，"
+              "已够页，原样测不拼页）")
     else:
         print(f"长语料     ：{big}  {best['pages']} 页 / {report['built_bytes']} bytes（原样测，不拼页）")
     print(f"机器       ：{report['machine']['processor'] or report['machine']['machine']} / "

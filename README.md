@@ -306,9 +306,13 @@ completion 这一栏**包含思维链 token**，别按「正文长度」估。
 - **抽取块失败已进退出码**：`chunks_failed > 0` → 退出码 4 + 文件名 `_PARTIAL` + 首页横幅点名失败块与缺失条目
   + CLI 清单；四处都由 `pipeline.chunk_failure_rows()` 一份明细生成（`tests/test_chunk_failure_exit.py` 钉住）。
   仍未做的是「自动只重跑失败块」——目前重跑一次会按缓存命中已完成的块（`out/_cache/`），失败的块重算。
-- **200 页 / 26 章的规模测试用的是 Markdown 语料**（`docs/PERF.md`）：解析+切章 0.12–0.13 s、
-  PDF 口径 12.06 s 是分开测的，**「26 章 + 200 页 PDF」端到端没有直接实测**。要消掉这条限定
-  需引入一个 dev-only 的 PDF 生成依赖，未做。
+- **200 页 / 26 章已有真 PDF 端到端实测**（`docs/PERF.md` §2–§3）：`scripts/make_bench_pdf.py`
+  生成 **204 页 / 26 章 / 2171 段**的中文 PDF（reportlab，dev-only），`scripts/bench_200p.py` 实测
+  解析+切章 **15.25 s**（最好）/ 15.25–19.85 s（区间），其中 pypdf 抽文 11.2–18.0 s、
+  切章 10.9 ms、废标扫描 8.3 ms、分块 3.7 ms（168 块）；单次全流程 bench 口径 15.45 s、
+  实际墙钟 18.8–19.6 s（预算 1200 s 的 1.29%–1.63%）。**切章/分块没有因真 PDF 退化**；
+  上一轮 Markdown 口径低估的是**块数**（人造 4000 字/页让块突破 2000 字上限，同样字数真 PDF 要多 2.3 倍块）。
+  仍有限定：条款正文是同一份 41 页语料的池子循环（页数/章节真实、内容重复），**生成阶段（LLM）未测**。
 - **CI 三条红线（pytest / ruff / 引用可回查）已写进 `.github/workflows/ci.yml`，但当前 GitHub 上是红的**：
   documind 是私有仓，actions 自带的 `GITHUB_TOKEN` 读不到它（`uv sync` 的 path 依赖需要兄弟目录）。
   工作流已给出两条修法（配 `DOCUMIND_TOKEN` fine-grained token，或把 documind 设为 public）；
