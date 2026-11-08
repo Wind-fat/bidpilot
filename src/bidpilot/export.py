@@ -25,6 +25,10 @@ BANNER_STAGED = "本文件只有抽取与能力矩阵结果：本次运行未生
 # 抽取阶段有块整块失败：文件里的应答少了几页的内容，必须点名「哪几块、缺什么」。
 # 这是条**动态**横幅（拼上失败块明细），所以只固定句首；README 退出码表钉的就是这个句首。
 BANNER_PARTIAL_HEAD = "本文件内容不完整（抽取阶段有块整块失败）："
+# 低产块：**不是失败**——条目全部通过 page/quote 校验，只是条数明显低于同章其它页段，
+# 因此措辞必须与 `_PARTIAL`（内容缺了）分开：这里是「可能漏抽，请补看原文」。
+# 退出码与文件名都不变（见 pipeline.exit_code_for），只靠横幅/正文/CLI 留痕。
+BANNER_LOW_YIELD_HEAD = "以下页段可能漏抽（不是失败：条目全部通过校验，但条数明显低于同章其它页段，请人工补看原文）："
 
 
 def chunk_shortfall(row: dict) -> str:
@@ -59,6 +63,24 @@ def partial_banner(rows: list[dict]) -> str:
         + "；".join(parts)
         + "。上述页段的内容不完整，不得直接作为投标文件使用。"
     )
+
+
+def low_yield_banner(rows: list[dict]) -> str:
+    """低产块横幅：每块给 chunk id、页码、抽到几条、产出率与同章均值——读者能自己判断该不该补看。
+
+    与 `partial_banner` 的区别只在措辞与后果：那边是「这些页的内容不在文件里」，
+    这边是「这些页可能少抽了，条目本身是合规的」。
+    """
+    parts: list[str] = []
+    for r in rows:
+        start, end = r.get("page_start"), r.get("page_end")
+        pages = f"p{start}" if start == end else f"p{start}-{end}"
+        where = f"（{r['section_title']}）" if r.get("section_title") else ""
+        parts.append(
+            f"{r.get('chunk_id') or '-'}{where} {pages} 只抽到 {r.get('items', 0)} 条"
+            f"（{r.get('yield_rate', 0)} 条/千字符，同章其它块均值 {r.get('peer_mean', 0)}）"
+        )
+    return BANNER_LOW_YIELD_HEAD + "；".join(parts) + "。"
 
 
 def _set_cn_font(document: Document, name: str = "宋体") -> None:
@@ -116,6 +138,7 @@ def build_docx(
     failed: bool = False,
     staged: bool = False,
     chunk_failures: list[dict] | None = None,
+    low_yield_chunks: list[dict] | None = None,
 ) -> Path:
     """payload: {title, doc_id, sections: [{title, items, paragraphs:[{text, sources, kind}]}], failures?, chunk_failures?}
 
@@ -128,6 +151,9 @@ def build_docx(
 
     `chunk_failures` 非空表示**抽取阶段有块整块失败**：那份内容根本没进来，
     首段横幅必须点名「哪几块、缺哪几页的什么」，正文再逐块列明细（退出码 4 / `_PARTIAL`）。
+
+    `low_yield_chunks` 非空表示**有条目数明显偏低的页段**（不是失败）：黄底横幅 + 正文明细，
+    措辞必须是「可能漏抽」，不得与 `_PARTIAL`（内容缺失）混用。
     """
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -135,11 +161,15 @@ def build_docx(
     _set_cn_font(document)
 
     rows = chunk_failures if chunk_failures is not None else payload.get("chunk_failures") or []
+    low_rows = low_yield_chunks if low_yield_chunks is not None else payload.get("low_yield_chunks") or []
     if failed:
         _add_banner(document, BANNER_FAILED, fill="FFC7CE")
     else:
         if rows:
             _add_banner(document, partial_banner(rows), fill="FFC7CE")
+        if low_rows:
+            # 黄色而不是红色：这是「请补看」，不是「这份文件缺内容」
+            _add_banner(document, low_yield_banner(low_rows), fill="FFF2CC")
         if staged:
             _add_banner(document, BANNER_STAGED, fill="EDEDED")
 
@@ -180,6 +210,18 @@ def build_docx(
             document.add_paragraph(
                 f"{r.get('chunk_id') or '-'}{where} {pages}：重试 {r.get('attempts', 0)} 次后仍失败，"
                 f"{chunk_shortfall(r)}；原因：{r.get('reason') or '未通过校验'}"
+            )
+
+    if low_rows:
+        document.add_heading("可能漏抽的页段（条目数偏低，不是失败，需人工补看）", level=1)
+        for r in low_rows:
+            pages = f"p{r.get('page_start')}" if r.get("page_start") == r.get("page_end") else f"p{r.get('page_start')}-{r.get('page_end')}"
+            where = f"（{r['section_title']}）" if r.get("section_title") else ""
+            document.add_paragraph(
+                f"{r.get('chunk_id') or '-'}{where} {pages}：只抽到 {r.get('items', 0)} 条，"
+                f"{r.get('items', 0)} 条 / {r.get('body_chars', 0)} 字 = {r.get('yield_rate', 0)} 条/千字符"
+                f"（{r.get('rule') or '低于同章均值'}），同章其它块均值 {r.get('peer_mean', 0)}。"
+                "这些条目本身通过了页码与原文校验，但条数明显偏低，请对照原文补看缺了哪些要求。"
             )
 
     item_by_id = {}

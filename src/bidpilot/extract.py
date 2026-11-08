@@ -113,6 +113,14 @@ class ChunkReport:
     escalated: bool = False
     errors: list[str] = field(default_factory=list)
     counts: dict[str, int] = field(default_factory=dict)
+    # ---- 「少而合法」护栏（见 mark_low_yield）----
+    # 块正文长度与「表格/清单型」判定：产出率要除以它才有可比性，
+    # 而低产只对结构化正文成立（须知类的散文页一段 2 条是正常的）。
+    body_chars: int = 0
+    structured: bool = False
+    # 条目/千字符；低于绝对阈值或同章兄弟块均值的 1/3 → low_yield
+    yield_rate: float = 0.0
+    low_yield: bool = False
 
 
 @dataclass(slots=True)
@@ -145,7 +153,8 @@ class ExtractResult:
             "tech_requirements": cnt(self.tech_requirements),
             "chunks": len(self.reports),
             "chunks_failed": failed,
-            "chunks_escalated": sum(1 for r in self.reports if r.escalated),
+                        "chunks_escalated": sum(1 for r in self.reports if r.escalated),
+                        "chunks_low_yield": [r.chunk_id for r in self.reports if r.low_yield],
             "usage": self.usage,
         }
 
@@ -400,7 +409,14 @@ def _initial_messages(chunk: Chunk) -> list[dict]:
 async def extract_chunk(llm: LLM, doc: TenderDoc, chunk: Chunk, max_retries: int = 2) -> tuple[ExtractionBatch, ChunkReport]:
     """单块抽取。最多重试 max_retries 次（默认 2），最后一次仍不合规的条目保留并标 needs_review。"""
     messages = _initial_messages(chunk)
-    report = ChunkReport(chunk_id=chunk.id, pages=(chunk.page_start, chunk.page_end), tasks=chunk.tasks)
+    report = ChunkReport(
+        chunk_id=chunk.id,
+        pages=(chunk.page_start, chunk.page_end),
+        tasks=chunk.tasks,
+        # 正文形态随块记录：低产判定要按「条目/千字符」比，且只对表格/清单型正文成立
+        body_chars=len(chunk.body),
+        structured=is_structured_body(chunk.body),
+    )
     best: ExtractionBatch | None = None
 
     for attempt in range(max_retries + 1):
@@ -469,6 +485,79 @@ async def extract_chunk(llm: LLM, doc: TenderDoc, chunk: Chunk, max_retries: int
         TASK_TECH: len(best.tech_requirements),
     }
     return best, report
+
+
+# ------------------------------------------------------- 低产块（「少而合法」）
+
+# 背景（docs/REAL-PROVIDER.md「p23-25 复跑三轮」）：同一块、同一 prompt、温度 0，
+# 三轮分别抽到 31 / 2 / 3 条，而 `ok=True`、needs_review=0、quote 100% 可回查 ——
+# 现有四道闸（空结果 / page 越界 / quote 对不上 / 章节越界）对「少而合法」零感知。
+# 这块护栏只做一件事：把「条目数明显偏低」变成一个**看得见**的标记，不改条目、不改退出码。
+LOW_YIELD_ABS = 2.0  # 条/千字符：低于它，不管同章其它块怎样都算低产
+LOW_YIELD_PEER_RATIO = 1.0 / 3.0  # 低于同章兄弟块均值的 1/3 也算低产
+LOW_YIELD_MIN_CHARS = 400  # 正文太短的块谈产出率没意义
+LOW_YIELD_MIN_PEERS = 2  # 「同章均值」至少要有 2 个兄弟块才谈得上
+# 表格/清单型正文的判据（只在结构化类块上判低产：须知类散文页一段 2 条是正常的，见 p4-4）：
+# PDF 把表格/清单打成一页十几行短行，正文则是一段几十上百字的长行。
+STRUCT_MIN_LINES = 12
+STRUCT_MAX_MEDIAN_LINE = 60
+
+
+def is_structured_body(body: str) -> bool:
+    """正文是否「表格/清单型」：行数够多且中位行长很短。
+
+    本仓实测（build_chunks, max_chars=2000，41 页语料）：p23-25 共 23 行、中位 27 字；
+    p26-28 共 27 行、中位 28 字；其余正文块中位 73-701 字。判据是**排版形状**而不是关键词，
+    因为表格在 PDF 抽文里往往只剩空格分隔的短行，没有任何表头可认。
+    """
+    lines = [x.strip() for x in body.splitlines() if x.strip() and not x.strip().startswith("[第")]
+    if len(lines) < STRUCT_MIN_LINES:
+        return False
+    lengths = sorted(len(x) for x in lines)
+    return lengths[len(lengths) // 2] <= STRUCT_MAX_MEDIAN_LINE
+
+
+def _items_of(report: ChunkReport) -> int:
+    return sum(int(v or 0) for v in (report.counts or {}).values())
+
+
+def _chapter_key(chunk_id: str) -> str:
+    return chunk_id.split("#", 1)[0]
+
+
+def peer_yield(reports: list[ChunkReport], report: ChunkReport) -> tuple[float, int]:
+    """同章兄弟块（不同块、有正文、抽到过条目）的 (产出率均值, 个数)，不含自己。"""
+    peers = [
+        r.yield_rate
+        for r in reports
+        if r is not report
+        and _chapter_key(r.chunk_id) == _chapter_key(report.chunk_id)
+        and r.ok
+        and r.body_chars >= LOW_YIELD_MIN_CHARS
+        and _items_of(r) > 0
+    ]
+    return (round(sum(peers) / len(peers), 2) if peers else 0.0, len(peers))
+
+
+def mark_low_yield(reports: list[ChunkReport]) -> list[ChunkReport]:
+    """就地填 `yield_rate` / `low_yield`，返回被判低产的块（顺序同入参）。
+
+    判定（三条同时成立才叫低产，全部可复算）：
+    1. 块**成功**（ok=False 的块走的是「整块失败」，已在退出码 4 / `_PARTIAL` 里）且抽到过条目；
+    2. **结构化类块**（`is_structured_body`）且正文 >= `LOW_YIELD_MIN_CHARS`；
+    3. `条目/千字符 < LOW_YIELD_ABS`，**或** `< 同章兄弟块均值 x 1/3`（兄弟块 >= 2 个时）。
+    只加标记：不删条目、不改 ok、不影响退出码。
+    """
+    for r in reports:
+        r.yield_rate = round(_items_of(r) * 1000 / r.body_chars, 2) if r.body_chars else 0.0
+        r.low_yield = False
+    for r in reports:
+        if not (r.ok and r.structured and r.body_chars >= LOW_YIELD_MIN_CHARS and _items_of(r) > 0):
+            continue
+        mean, n = peer_yield(reports, r)
+        if r.yield_rate < LOW_YIELD_ABS or (n >= LOW_YIELD_MIN_PEERS and r.yield_rate < mean * LOW_YIELD_PEER_RATIO):
+            r.low_yield = True
+    return [r for r in reports if r.low_yield]
 
 
 def _key(kind: str, quote: str, extra: str) -> str:
@@ -621,6 +710,9 @@ async def extract(
                 blob = json.loads(path.read_text(encoding="utf-8"))
                 report = ChunkReport(**blob["report"])
                 report.pages = (int(report.pages[0]), int(report.pages[1]))
+                # 旧缓存没有 body_chars/structured：按本块正文补齐，否则低产判定会静默失效
+                report.body_chars = report.body_chars or len(chunk.body)
+                report.structured = report.structured or is_structured_body(chunk.body)
                 log.info("chunk %s 命中缓存 ok=%s counts=%s", chunk.id, report.ok, report.counts)
                 return ExtractionBatch(**blob["batch"]), report
             except Exception as exc:  # 缓存损坏就重算，不阻断
@@ -645,4 +737,6 @@ async def extract(
         res.disqualifications.extend(batch.disqualifications)
         res.tech_requirements.extend(batch.tech_requirements)
         res.reports.append(report)
+    # 块级汇总之后才算得出「同章均值」：低产标记必须在 merge 之前落好，下游三处（CLI/docx/problems）只读它
+    mark_low_yield(res.reports)
     return merge(res)

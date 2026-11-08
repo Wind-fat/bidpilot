@@ -89,6 +89,19 @@ def main() -> int:
         )
     if chunk_rows:
         print(f"    交付物标记：文件名后缀 {res.suffix}，退出码 {res.exit_code}（抽取内容不完整）")
+    low_rows = res.low_yield_chunks()
+    print(
+        f"低产块      ：{len(low_rows)} 块"
+        "（条目数明显低于同章其它页段 → 可能漏抽；不是失败，退出码与文件名不变）"
+    )
+    for row in low_rows:
+        pages = f"p{row['page_start']}" if row["page_start"] == row["page_end"] else f"p{row['page_start']}-{row['page_end']}"
+        where = f"（{row['section_title']}）" if row["section_title"] else ""
+        print(
+            f"    ~ 低产：{row['chunk_id']}{where} {pages} → 只抽到 {row['items']} 条 "
+            f"（{row['yield_rate']} 条/千字符，{row['rule']}，同章其它块均值 {row['peer_mean']}）"
+            "：请对照原文补看"
+        )
     print("-" * 68)
     m = stats["capability_matrix"]
     print(f"需求-能力矩阵：共 {m['total']} 条  满足 {m.get('满足', 0)} / 部分满足 {m.get('部分满足', 0)} / 不满足 {m.get('不满足', 0)}")

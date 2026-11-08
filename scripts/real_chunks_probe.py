@@ -32,6 +32,7 @@ from bidpilot.extract import (  # noqa: E402
     ExtractResult,
     build_chunks,
     extract_chunk,
+    is_structured_body,
     locate_quote_span,
     merge,
 )
@@ -42,19 +43,26 @@ DEFAULT_CREDS = Path.home() / ".config" / "magpie" / "providers.json"
 
 
 class RecordingLLM:
-    """把每次 `complete` 的耗时 / token / thinking 记下来，其余行为原样透传。"""
+    """把每次 `complete` 的耗时 / token / thinking 记下来，其余行为原样透传。
 
-    def __init__(self, inner: ChatClient) -> None:
+    `force_thinking=True` 时把 thinking 一律改写为 True —— 定性实验要问的是
+    「消除了『首轮关 / 重试升级』这条路径之后，这块还会不会忽多忽少」，
+    所以第一次尝试就必须开思考，不能靠 extract_chunk 的 escalate。
+    """
+
+    def __init__(self, inner: ChatClient, force_thinking: bool | None = None) -> None:
         self.inner = inner
+        self.force_thinking = force_thinking
         self.calls: list[dict] = []
 
     async def complete(self, messages, *, json_mode=True, max_tokens=None, thinking=None) -> LLMReply:  # noqa: ANN001
-        rec = {"thinking": thinking, "elapsed_s": 0.0, "prompt_tokens": 0, "completion_tokens": 0,
+        sent = thinking if self.force_thinking is None else self.force_thinking
+        rec = {"thinking": sent, "elapsed_s": 0.0, "prompt_tokens": 0, "completion_tokens": 0,
                "reply_chars": 0, "reply_head": "", "error": None}
         t0 = time.perf_counter()
         try:
             reply = await self.inner.complete(
-                messages, json_mode=json_mode, max_tokens=max_tokens, thinking=thinking
+                messages, json_mode=json_mode, max_tokens=max_tokens, thinking=sent
             )
         except LLMError as exc:
             rec["elapsed_s"] = round(time.perf_counter() - t0, 1)
@@ -113,6 +121,13 @@ async def main() -> int:
     ap.add_argument("--creds", default=str(DEFAULT_CREDS))
     ap.add_argument("--provider-name", default="Qwen (China)")
     ap.add_argument("--timeout-s", type=float, default=None, help="覆盖 Settings.llm_timeout_s")
+    ap.add_argument(
+        "--thinking",
+        choices=["default", "always", "off"],
+        default="default",
+        help="always=每次尝试都显式开思考（定性实验用，不让 escalate 决定）；off=显式关；default=按 Settings",
+    )
+    ap.add_argument("--repeat", type=int, default=1, help="同一块重复跑几轮（每轮独立，不复用上一轮结果）")
     args = ap.parse_args()
 
     s = _settings(args)
@@ -122,60 +137,66 @@ async def main() -> int:
     if len(chunks) != len(wanted):
         raise SystemExit(f"只匹配到 {len(chunks)} 块 / 期望 {len(wanted)}：{[c.id for c in chunks]}")
 
+    force = {"always": True, "off": False, "default": None}[args.thinking]
     print(f"pdf={args.pdf} pages={doc.page_count} model={s.llm_model} base={s.llm_base_url}")
     print(f"timeout_s={s.llm_timeout_s} thinking_default={s.llm_enable_thinking} "
-          f"chunks={len(chunks)} max_chars={args.max_chars}")
+          f"thinking_forced={force} repeat={args.repeat} chunks={len(chunks)} max_chars={args.max_chars}")
 
     client = ChatClient(s)
     result = ExtractResult(title=doc.title, source=str(doc.path))
     rows: list[dict] = []
     try:
         for chunk in chunks:
-            rec = RecordingLLM(client)
-            t0 = time.perf_counter()
-            batch, report = await extract_chunk(rec, doc, chunk, max_retries=args.max_retries)
-            wall = round(time.perf_counter() - t0, 1)
-            items = [*batch.scoring_items, *batch.disqualifications, *batch.tech_requirements]
-            check = _quote_check(doc, items)
-            row = {
-                "chunk_id": chunk.id,
-                "pages": [chunk.page_start, chunk.page_end],
-                "tasks": chunk.tasks,
-                "body_chars": len(chunk.body),
-                "attempts": report.attempts,
-                "escalated": report.escalated,
-                "ok": report.ok,
-                "counts": report.counts,
-                "items": len(items),
-                "needs_review": sum(1 for i in items if i.needs_review),
-                "quote_check": check,
-                "items_detail": [
-                    {"page": it.page, "page_end": getattr(it, "page_end", None), "quote": it.quote,
-                     "label": getattr(it, "no", "") or getattr(it, "item", "") or getattr(it, "category", ""),
-                     "needs_review": it.needs_review}
-                    for it in items
-                ],
-                "wall_s": wall,
-                "attempt_detail": rec.calls,
-                "prompt_tokens": sum(c["prompt_tokens"] for c in rec.calls),
-                "completion_tokens": sum(c["completion_tokens"] for c in rec.calls),
-                "errors": report.errors,
-            }
-            rows.append(row)
-            print("-" * 78)
-            print(f"{chunk.id}  pages p{chunk.page_start}-{chunk.page_end}  body={len(chunk.body)} 字  wall={wall}s")
-            for i, call in enumerate(rec.calls, 1):
-                print(f"  attempt {i}: thinking={call['thinking']} {call['elapsed_s']}s "
-                      f"prompt={call['prompt_tokens']} completion={call['completion_tokens']} "
-                      f"reply={call['reply_chars']}字 err={call['error']}")
-                print(f"    reply_head={call['reply_head'][:100]!r}")
-            print(f"  attempts={report.attempts} escalated={report.escalated} ok={report.ok} counts={report.counts}")
-            print(f"  items={len(items)} needs_review={row['needs_review']} "
-                  f"quote回查={check['located']}/{check['total']}")
-            result.scoring_items.extend(batch.scoring_items)
-            result.disqualifications.extend(batch.disqualifications)
-            result.tech_requirements.extend(batch.tech_requirements)
-            result.reports.append(report)
+            for rnd in range(1, max(1, args.repeat) + 1):
+                rec = RecordingLLM(client, force_thinking=force)
+                t0 = time.perf_counter()
+                batch, report = await extract_chunk(rec, doc, chunk, max_retries=args.max_retries)
+                wall = round(time.perf_counter() - t0, 1)
+                items = [*batch.scoring_items, *batch.disqualifications, *batch.tech_requirements]
+                check = _quote_check(doc, items)
+                row = {
+                    "chunk_id": chunk.id,
+                    "round": rnd,
+                    "pages": [chunk.page_start, chunk.page_end],
+                    "tasks": chunk.tasks,
+                    "body_chars": len(chunk.body),
+                    "structured": is_structured_body(chunk.body),
+                    "yield_rate": round(len(items) * 1000 / max(1, len(chunk.body)), 2),
+                    "attempts": report.attempts,
+                    "escalated": report.escalated,
+                    "ok": report.ok,
+                    "counts": report.counts,
+                    "items": len(items),
+                    "needs_review": sum(1 for i in items if i.needs_review),
+                    "quote_check": check,
+                    "items_detail": [
+                        {"page": it.page, "page_end": getattr(it, "page_end", None), "quote": it.quote,
+                         "label": getattr(it, "no", "") or getattr(it, "item", "") or getattr(it, "category", ""),
+                         "needs_review": it.needs_review}
+                        for it in items
+                    ],
+                    "wall_s": wall,
+                    "attempt_detail": rec.calls,
+                    "prompt_tokens": sum(c["prompt_tokens"] for c in rec.calls),
+                    "completion_tokens": sum(c["completion_tokens"] for c in rec.calls),
+                    "errors": report.errors,
+                }
+                rows.append(row)
+                print("-" * 78)
+                print(f"[round {rnd}/{args.repeat}] {chunk.id}  pages p{chunk.page_start}-{chunk.page_end}  "
+                      f"body={len(chunk.body)} 字  wall={wall}s")
+                for i, call in enumerate(rec.calls, 1):
+                    print(f"  attempt {i}: thinking={call['thinking']} {call['elapsed_s']}s "
+                          f"prompt={call['prompt_tokens']} completion={call['completion_tokens']} "
+                          f"reply={call['reply_chars']}字 err={call['error']}")
+                    print(f"    reply_head={call['reply_head'][:100]!r}")
+                print(f"  attempts={report.attempts} escalated={report.escalated} ok={report.ok} counts={report.counts}")
+                print(f"  items={len(items)} needs_review={row['needs_review']} "
+                      f"quote回查={check['located']}/{check['total']} yield={row['yield_rate']} 条/千字符")
+                result.scoring_items.extend(batch.scoring_items)
+                result.disqualifications.extend(batch.disqualifications)
+                result.tech_requirements.extend(batch.tech_requirements)
+                result.reports.append(report)
     finally:
         await client.aclose()
 
@@ -190,6 +211,8 @@ async def main() -> int:
         "base_url": s.llm_base_url,
         "timeout_s": s.llm_timeout_s,
         "thinking_default": s.llm_enable_thinking,
+        "thinking_forced": force,
+        "repeat": args.repeat,
         "max_chars": args.max_chars,
         "calls": total_calls,
         "prompt_tokens": total_prompt,
@@ -200,8 +223,15 @@ async def main() -> int:
         "rows": rows,
     }
     print("=" * 78)
-    print(f"合计：{len(rows)} 块 / {total_calls} 次调用 / {total_wall}s / "
+    print(f"合计：{len(rows)} 轮 / {total_calls} 次调用 / {total_wall}s / "
           f"prompt {total_prompt} tok / completion {total_completion} tok")
+    if args.repeat > 1:
+        print("逐轮对照（同一个块、同一 prompt、温度 0）：")
+        for r in rows:
+            print(f"  round {r['round']}: items={r['items']:3d} yield={r['yield_rate']:6.2f} 条/千字符 "
+                  f"wall={r['wall_s']:6.1f}s calls={len(r['attempt_detail'])} "
+                  f"prompt={r['prompt_tokens']} completion={r['completion_tokens']} "
+                  f"needs_review={r['needs_review']} quote={r['quote_check']['located']}/{r['quote_check']['total']}")
     if args.out:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         Path(args.out).write_text(

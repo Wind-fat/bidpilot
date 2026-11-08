@@ -17,7 +17,18 @@ from .capabilities import CapabilityIndex, RequirementMatch, build_matrix, load_
 from .config import Settings, get_settings
 from .db import SqliteStore, init_db, make_engine, save_document, save_generation
 from .export import BANNER_EXAMPLE_CAPS, build_docx, chunk_shortfall
-from .extract import ExtractResult, dump_extract, extract, load_extract, relocate
+from .extract import (
+    LOW_YIELD_ABS,
+    ExtractResult,
+    build_chunks,
+    dump_extract,
+    extract,
+    is_structured_body,
+    load_extract,
+    mark_low_yield,
+    peer_yield,
+    relocate,
+)
 from .llm import LLM, ChatClient
 from .sections import TenderDoc, load_tender
 from .workflow import MemoryStore, WorkflowEngine, WorkflowResult
@@ -86,8 +97,69 @@ def chunk_failure_rows(extraction, tender=None) -> list[dict]:
     return rows
 
 
+def low_yield_rows(extraction, tender=None) -> list[dict]:
+    """低产块明细（CLI 清单 / docx 横幅 / problems() 共用这一份）。
+
+    「低产」= 块成功、条目全合规，但条数明显低于同章其它页段（`extract.mark_low_yield`）。
+    它不是失败：交付物里的条目一条都没少校验，只是**可能漏抽**——所以退出码与文件名都不变，
+    但必须让打开文件的人看到「这几页要补看原文」。
+    """
+    reports = list(getattr(extraction, "reports", None) or [])
+    sections = {s.id: s.title for s in getattr(tender, "sections", None) or []}
+    rows: list[dict] = []
+    for r in reports:
+        if not getattr(r, "low_yield", False):
+            continue
+        pages = getattr(r, "pages", (0, 0))
+        items = sum(int(v or 0) for v in (getattr(r, "counts", None) or {}).values())
+        mean, n = peer_yield(reports, r)
+        over_abs = r.yield_rate < LOW_YIELD_ABS
+        rows.append(
+            {
+                "chunk_id": r.chunk_id,
+                "page_start": int(pages[0]),
+                "page_end": int(pages[1]),
+                "section_title": sections.get(r.chunk_id.split("#", 1)[0], ""),
+                "items": items,
+                "body_chars": int(r.body_chars),
+                "yield_rate": float(r.yield_rate),
+                "peer_mean": mean,
+                "peers": n,
+                "tasks": list(r.tasks),
+                "labels": [TASK_LABELS.get(t, t) for t in r.tasks],
+                # 判定依据要能复算：命中哪一条、跟谁比、比的是多少
+                "rule": f"低于绝对下限 {LOW_YIELD_ABS} 条/千字符" if over_abs
+                else f"低于同章其它块均值 {mean} 的 1/3（{n} 个兄弟块）",
+            }
+        )
+    return rows
+
+
+def refresh_chunk_yields(extraction, tender, max_chars: int) -> None:
+    """按**本次实际分块**补回 body_chars / structured，然后重算低产标记。
+
+    复用旧版 `--extract-json` 或用旧缓存时，report 里没有正文长度与正文形态，
+    低产判定会静默失效（= 又一个「看起来是绿的」）。分块对不上（换了 max_chars / 换了文档）就跳过，
+    只加标记、不改条目。
+    """
+    reports = list(getattr(extraction, "reports", None) or [])
+    if not reports:
+        return
+    bodies = {c.id: c.body for c in build_chunks(tender, max_chars=max_chars)} if tender is not None else {}
+    for r in reports:
+        body = bodies.get(r.chunk_id)
+        if body is None:
+            continue
+        r.body_chars = r.body_chars or len(body)
+        r.structured = is_structured_body(body)
+    mark_low_yield(reports)
+
+
 def exit_code_for(severities) -> int:
-    """把 problems() 的严重度集合压成一个稳定退出码；顺序即优先级（4 > 2 > 3 > 0）。"""
+    """把 problems() 的严重度集合压成一个稳定退出码；顺序即优先级（4 > 2 > 3 > 0）。
+
+    `low_yield` 故意不参与：低产块不是失败（条目全部通过校验），只让用户看见「可能漏抽」。
+    """
     sev = set(severities)
     if sev & INCOMPLETE_SEVERITIES:
         return EXIT_INCOMPLETE
@@ -135,6 +207,10 @@ class PipelineResult:
         """抽取阶段整块失败的页段（problems / 横幅 / 文件名 / CLI 共用的唯一明细）。"""
         return chunk_failure_rows(self.extraction, self.tender)
 
+    def low_yield_chunks(self) -> list[dict]:
+        """条目数明显偏低的页段（「少而合法」）：不是失败，但可能在交付物里留下空洞。"""
+        return low_yield_rows(self.extraction, self.tender)
+
     def problems(self) -> list[dict]:
         """交付物污染清单：workflow 的三个级别 + 抽取块失败 + 空交付物 + 示例能力库。"""
         out = list(self.workflow.problems())
@@ -151,6 +227,24 @@ class PipelineResult:
                     ),
                     "pages": [row["page_start"], row["page_end"]],
                     "missing": row["missing"],
+                }
+            )
+        # 少而合法：条目全合规、quote 全可回查，但条数明显偏低 —— 不是失败，退出码不变，
+        # 但绝不能只写在 docx 里：CLI 与 problems() 也要能读到（否则用户看不到）。
+        for row in self.low_yield_chunks():
+            where = f"（{row['section_title']}）" if row["section_title"] else ""
+            out.append(
+                {
+                    "section_id": row["chunk_id"],
+                    "title": f"低产块 p{row['page_start']}-{row['page_end']}{where}",
+                    "severity": "low_yield",
+                    "reason": (
+                        f"只抽到 {row['items']} 条（{row['yield_rate']} 条/千字符，"
+                        f"{row['rule']}）：条目全部通过校验，但可能漏抽了大部分内容，"
+                        "请人工核对这几页原文；不是失败，退出码不变"
+                    ),
+                    "pages": [row["page_start"], row["page_end"]],
+                    "yield_rate": row["yield_rate"],
                 }
             )
         if self.empty_delivery:
@@ -203,6 +297,7 @@ class PipelineResult:
                 "mock_allowed": self.allow_mock,
                 "empty_delivery": self.empty_delivery,
                 "chunk_failures": self.chunk_failures(),
+                "low_yield_chunks": self.low_yield_chunks(),
             },
             "docx": {"path": str(self.docx_path), "bytes": self.docx_bytes},
             "capability_library_note": self.capability_meta,
@@ -291,8 +386,16 @@ async def run_pipeline(
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps(dump_extract(extraction), ensure_ascii=False, indent=2), encoding="utf-8")
     extract_s = round(time.perf_counter() - t_extract0, 1)
+    # 低产块要按「本份文档的实际分块」算产出率：旧 extract JSON / 旧缓存缺 body_chars，这里补回并重算标记
+    refresh_chunk_yields(extraction, tender, max_chars or s.chunk_max_chars)
     # 整块失败的页段：problems / 文件名 / 首页横幅 / CLI 清单都从这一份明细出发（四处同源）
     chunk_rows = chunk_failure_rows(extraction, tender)
+    low_rows = low_yield_rows(extraction, tender)
+    if low_rows:
+        log.warning(
+            "抽取有 %d 块低产（条目数明显偏低，可能漏抽；不是失败，退出码不变）：%s",
+            len(low_rows), [r["chunk_id"] for r in low_rows],
+        )
     if chunk_rows:
         log.warning("抽取有 %d 块整块失败（交付物不完整，退出码 4）：%s", len(chunk_rows), [r["chunk_id"] for r in chunk_rows])
     # 抽取阶段真正发生的调用数（缓存命中时为 0，重试会多算）
@@ -346,6 +449,7 @@ async def run_pipeline(
     docx_path = out / f"{Path(pdf_path).stem}_技术应答初稿{suffix}.docx"
     payload = dict(aggregated)
     payload["chunk_failures"] = chunk_rows
+    payload["low_yield_chunks"] = low_rows
     if empty_delivery:
         payload["failures"] = [p for p in workflow.problems() if p["severity"] in ("failed", "incomplete")]
     build_docx(
@@ -356,6 +460,7 @@ async def run_pipeline(
         failed=empty_delivery,
         staged=not generate,
         chunk_failures=chunk_rows,
+        low_yield_chunks=low_rows,
     )
 
     if engine is not None:
