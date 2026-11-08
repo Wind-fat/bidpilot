@@ -99,9 +99,9 @@ def main() -> int:
         where = f"（{row['section_title']}）" if row["section_title"] else ""
         print(
             f"    ~ 低产：{row['chunk_id']}{where} {pages} → 只抽到 {row['items']} 条 "
-            f"（{row['yield_rate']} 条/千字符，{row['rule']}，同章其它块均值 {row['peer_mean']}）"
-            "：请对照原文补看"
+            f"（{row['yield_rate']} 条/千字符）：请对照原文补看"
         )
+        print(f"      {row['rule']}")
     print("-" * 68)
     m = stats["capability_matrix"]
     print(f"需求-能力矩阵：共 {m['total']} 条  满足 {m.get('满足', 0)} / 部分满足 {m.get('部分满足', 0)} / 不满足 {m.get('不满足', 0)}")

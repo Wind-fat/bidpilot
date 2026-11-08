@@ -216,6 +216,10 @@ async def test_low_yield_leaves_four_consistent_traces(tmp_path):
     assert not any(t.startswith(BANNER_PARTIAL_HEAD) for t in texts), "低产不是「内容缺失」"
     assert any("可能漏抽的页段" in t for t in texts)
     assert any(low_id in t and "条/千字符" in t for t in texts)
+    # 判定依据可审计：横幅/正文要点明命中规则与对比基准（兄弟块均值 + 样本数）
+    assert "命中规则" in texts[0] and "对比基准" in texts[0], texts[0]
+    assert "个兄弟块" in texts[0], texts[0]
+    assert any("命中规则" in t and "对比基准" in t for t in texts[1:])
 
     # 4) CLI 清单（format_degradation_report 与 run_pipeline 打印的是同一份 problems()）
     report = "\n".join(format_degradation_report(res))
@@ -279,6 +283,49 @@ def test_cli_lists_low_yield_chunk_and_keeps_exit_code_zero(tmp_path):
     assert "可能漏抽" in proc.stdout and "不是失败" in proc.stdout
     assert "_PARTIAL" not in proc.stdout
     assert (out_dir / "tender_jiangsu_技术应答初稿.docx").exists()
+
+
+def test_cli_env_thresholds_can_silence_low_yield(tmp_path):
+    """同一份 extract JSON、同一个低产块：把两把阈值调到它下面，CLI 就必须不再报低产（env 真进到了判定里）。
+
+    这是「阈值可配」的端到端证据：不重新抽取、不调模型，只改环境变量。
+    """
+    extract_json, _low_id, _ = _write_low_yield_extract(tmp_path)
+    out_dir = tmp_path / "out"
+    env = {
+        **os.environ,
+        "PYTHONIOENCODING": "utf-8",
+        "BIDPILOT_CAPABILITIES": str(_caps_file(tmp_path)),
+        # 该块 1.27 条/千字符；绝对下限压到 1.0、比例压到 0.01（7.96 × 0.01 = 0.08）→ 两条判据都不成立
+        "BIDPILOT_LOW_YIELD_ABS": "1.0",
+        "BIDPILOT_LOW_YIELD_PEER_RATIO": "0.01",
+    }
+    env.pop("BIDPILOT_ALLOW_MOCK", None)
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "run_pipeline.py"),
+            str(JIANGSU),
+            "--extract-json",
+            str(extract_json),
+            "--no-generate",
+            "--no-db",
+            "--out-dir",
+            str(out_dir),
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+        timeout=300,
+    )
+    assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
+    assert "低产块      ：0 块" in proc.stdout, proc.stdout
+    assert "[low_yield]" not in proc.stdout, proc.stdout
+    texts = _docx_texts(out_dir / "tender_jiangsu_技术应答初稿.docx")
+    assert not any(t.startswith(BANNER_LOW_YIELD_HEAD) for t in texts), "阈值调低后横幅不该出现"
 
 
 def test_docs_pin_low_yield_rule_banner_and_strategy():

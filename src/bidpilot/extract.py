@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import asdict, dataclass, field
@@ -121,6 +122,14 @@ class ChunkReport:
     # 条目/千字符；低于绝对阈值或同章兄弟块均值的 1/3 → low_yield
     yield_rate: float = 0.0
     low_yield: bool = False
+    # ---- 判定依据（可审计：CLI / docx / problems() 只读这几项，不各算一遍）----
+    # 判这一刻的同章兄弟块基准与命中的规则都要落盘：否则「为什么标红」只能靠复算，
+    # 而阈值可配之后，事后用别的阈值复算必然得出另一个结论。
+    peer_mean: float = 0.0
+    peer_count: int = 0
+    hit_abs: bool = False  # 命中「绝对下限」
+    hit_peer: bool = False  # 命中「同章兄弟块均值 × 比例」
+    thresholds: dict = field(default_factory=dict)  # 判定时实际生效的四个阈值（空=未判）
 
 
 @dataclass(slots=True)
@@ -502,6 +511,60 @@ LOW_YIELD_MIN_PEERS = 2  # 「同章均值」至少要有 2 个兄弟块才谈�
 STRUCT_MIN_LINES = 12
 STRUCT_MAX_MEDIAN_LINE = 60
 
+# 四个默认值只在上面一处定义；环境变量与之同名（`BIDPILOT_` + 常量名），语义见 README 的
+# 「低产阈值（可配）」表。默认值即上次校准的那组——换语料/换 `max_chars` 前请先改这里**并**改表。
+_ENV_ABS = "BIDPILOT_LOW_YIELD_ABS"
+_ENV_PEER_RATIO = "BIDPILOT_LOW_YIELD_PEER_RATIO"
+_ENV_MIN_CHARS = "BIDPILOT_LOW_YIELD_MIN_CHARS"
+_ENV_MIN_PEERS = "BIDPILOT_LOW_YIELD_MIN_PEERS"
+# 键名 ↔ 环境变量：README 表、drift 测试、敏感性脚本都从这里取，避免三处各写一遍字符串
+LOW_YIELD_ENV = {
+    "abs": _ENV_ABS,
+    "peer_ratio": _ENV_PEER_RATIO,
+    "min_chars": _ENV_MIN_CHARS,
+    "min_peers": _ENV_MIN_PEERS,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class LowYieldThresholds:
+    """低产判定的四个阈值。默认值 = 常量 = README 表（`tests/test_low_yield_thresholds.py` 钉住三者一致）。"""
+
+    abs_rate: float = LOW_YIELD_ABS
+    peer_ratio: float = LOW_YIELD_PEER_RATIO
+    min_chars: int = LOW_YIELD_MIN_CHARS
+    min_peers: int = LOW_YIELD_MIN_PEERS
+
+    def as_dict(self) -> dict:
+        return {
+            "abs": self.abs_rate,
+            "peer_ratio": self.peer_ratio,
+            "min_chars": self.min_chars,
+            "min_peers": self.min_peers,
+        }
+
+
+def _env_num(name: str, default, cast):
+    """环境变量解析：缺省/空串/写错都回落到默认值（写错要留一条 warning，不能静默改判据）。"""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return cast(raw.strip())
+    except ValueError:
+        log.warning("环境变量 %s=%r 不是合法数字，低产判定沿用默认值 %r", name, raw, default)
+        return default
+
+
+def low_yield_thresholds() -> LowYieldThresholds:
+    """当前生效的四个阈值（**每次调用都读环境变量**：进程内改 env 立即影响下一次判定）。"""
+    return LowYieldThresholds(
+        abs_rate=_env_num(_ENV_ABS, LOW_YIELD_ABS, float),
+        peer_ratio=_env_num(_ENV_PEER_RATIO, LOW_YIELD_PEER_RATIO, float),
+        min_chars=_env_num(_ENV_MIN_CHARS, LOW_YIELD_MIN_CHARS, int),
+        min_peers=_env_num(_ENV_MIN_PEERS, LOW_YIELD_MIN_PEERS, int),
+    )
+
 
 def is_structured_body(body: str) -> bool:
     """正文是否「表格/清单型」：行数够多且中位行长很短。
@@ -525,38 +588,95 @@ def _chapter_key(chunk_id: str) -> str:
     return chunk_id.split("#", 1)[0]
 
 
-def peer_yield(reports: list[ChunkReport], report: ChunkReport) -> tuple[float, int]:
+def peer_yield(
+    reports: list[ChunkReport], report: ChunkReport, thresholds: LowYieldThresholds | None = None
+) -> tuple[float, int]:
     """同章兄弟块（不同块、有正文、抽到过条目）的 (产出率均值, 个数)，不含自己。"""
+    t = thresholds or low_yield_thresholds()
     peers = [
         r.yield_rate
         for r in reports
         if r is not report
         and _chapter_key(r.chunk_id) == _chapter_key(report.chunk_id)
         and r.ok
-        and r.body_chars >= LOW_YIELD_MIN_CHARS
+        and r.body_chars >= t.min_chars
         and _items_of(r) > 0
     ]
     return (round(sum(peers) / len(peers), 2) if peers else 0.0, len(peers))
 
 
-def mark_low_yield(reports: list[ChunkReport]) -> list[ChunkReport]:
-    """就地填 `yield_rate` / `low_yield`，返回被判低产的块（顺序同入参）。
+def _ratio_label(ratio: float) -> str:
+    """比例的可读写法：默认的 1/3 写成 `1/3`，自定义值写成数字（`0.5`）。"""
+    for num, den in ((1, 2), (2, 3), (1, 3), (1, 4), (3, 4)):
+        if abs(ratio - num / den) < 1e-9:
+            return f"{num}/{den}"
+    return f"{ratio:g}"
+
+
+def _num_label(x: float) -> str:
+    """阈值/门槛的可读写法：整数值写成 `2.0`（与 README 表一致），其余按原精度。"""
+    return f"{float(x):.1f}" if float(x) == int(float(x)) else f"{float(x):g}"
+
+
+def low_yield_basis(r: ChunkReport) -> str:
+    """「命中哪条规则 + 跟谁比」的一句话（可复算）。
+
+    `mark_low_yield` 判的这一刻就把基准与命中规则写进 report，这里只做排版 ——
+    CLI / docx / problems() 因此不可能各算一份、也不可能在阈值被改后给出互相矛盾的说法。
+    人工判断「误报还是真漏」靠的正是这两项：绝对下限说明它绝对稀疏；同章均值比例说明它
+    相对同章显著稀疏（所以也要看兄弟块有几个、均值多少）。
+    """
+    t = r.thresholds or {}
+    abs_rate = t.get("abs", LOW_YIELD_ABS)
+    ratio = t.get("peer_ratio", LOW_YIELD_PEER_RATIO)
+    min_peers = int(t.get("min_peers", LOW_YIELD_MIN_PEERS))
+    hits: list[str] = []
+    if r.hit_abs:
+        hits.append(f"低于绝对下限 {_num_label(abs_rate)} 条/千字符（实际 {r.yield_rate}）")
+    if r.hit_peer:
+        cut = round(r.peer_mean * ratio, 2)
+        hits.append(f"低于同章其它块均值 {r.peer_mean} 的 {_ratio_label(ratio)}（= {_num_label(cut)} 条/千字符）")
+    rule = "、".join(hits) or "未命中任何规则"
+    if r.peer_count >= min_peers:
+        basis = f"对比基准：同章 {r.peer_count} 个兄弟块，均值 {r.peer_mean} 条/千字符"
+    else:
+        basis = (
+            f"对比基准：同章可用兄弟块仅 {r.peer_count} 个（< {min_peers}，"
+            f"均值比例判据不适用），只按绝对下限判"
+        )
+    return f"命中规则：{rule}；{basis}"
+
+
+def mark_low_yield(
+    reports: list[ChunkReport], thresholds: LowYieldThresholds | None = None
+) -> list[ChunkReport]:
+    """就地填 `yield_rate` / `low_yield` / 判定依据，返回被判低产的块（顺序同入参）。
 
     判定（三条同时成立才叫低产，全部可复算）：
     1. 块**成功**（ok=False 的块走的是「整块失败」，已在退出码 4 / `_PARTIAL` 里）且抽到过条目；
-    2. **结构化类块**（`is_structured_body`）且正文 >= `LOW_YIELD_MIN_CHARS`；
-    3. `条目/千字符 < LOW_YIELD_ABS`，**或** `< 同章兄弟块均值 x 1/3`（兄弟块 >= 2 个时）。
+    2. **结构化类块**（`is_structured_body`）且正文 >= `min_chars`；
+    3. `条目/千字符 < abs`，**或** `< 同章兄弟块均值 x peer_ratio`（兄弟块 >= `min_peers` 个时）。
+
+    四个阈值默认取常量，可被 `BIDPILOT_LOW_YIELD_*` 覆盖（`low_yield_thresholds()`，每次调用现读）。
     只加标记：不删条目、不改 ok、不影响退出码。
     """
+    t = thresholds or low_yield_thresholds()
     for r in reports:
         r.yield_rate = round(_items_of(r) * 1000 / r.body_chars, 2) if r.body_chars else 0.0
         r.low_yield = False
+        r.peer_mean = 0.0
+        r.peer_count = 0
+        r.hit_abs = False
+        r.hit_peer = False
+        r.thresholds = {}
     for r in reports:
-        if not (r.ok and r.structured and r.body_chars >= LOW_YIELD_MIN_CHARS and _items_of(r) > 0):
+        if not (r.ok and r.structured and r.body_chars >= t.min_chars and _items_of(r) > 0):
             continue
-        mean, n = peer_yield(reports, r)
-        if r.yield_rate < LOW_YIELD_ABS or (n >= LOW_YIELD_MIN_PEERS and r.yield_rate < mean * LOW_YIELD_PEER_RATIO):
-            r.low_yield = True
+        mean, n = peer_yield(reports, r, t)
+        r.peer_mean, r.peer_count, r.thresholds = mean, n, t.as_dict()
+        r.hit_abs = r.yield_rate < t.abs_rate
+        r.hit_peer = n >= t.min_peers and r.yield_rate < mean * t.peer_ratio
+        r.low_yield = r.hit_abs or r.hit_peer
     return [r for r in reports if r.low_yield]
 
 

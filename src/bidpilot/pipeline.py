@@ -18,13 +18,13 @@ from .config import Settings, get_settings
 from .db import SqliteStore, init_db, make_engine, save_document, save_generation
 from .export import BANNER_EXAMPLE_CAPS, build_docx, chunk_shortfall
 from .extract import (
-    LOW_YIELD_ABS,
     ExtractResult,
     build_chunks,
     dump_extract,
     extract,
     is_structured_body,
     load_extract,
+    low_yield_basis,
     mark_low_yield,
     peer_yield,
     relocate,
@@ -112,8 +112,12 @@ def low_yield_rows(extraction, tender=None) -> list[dict]:
             continue
         pages = getattr(r, "pages", (0, 0))
         items = sum(int(v or 0) for v in (getattr(r, "counts", None) or {}).values())
-        mean, n = peer_yield(reports, r)
-        over_abs = r.yield_rate < LOW_YIELD_ABS
+        # 判定基准与命中规则在 mark_low_yield 判的那一刻就写进 report 了：这里只读，不再复算
+        # （阈值可配之后，事后拿「现在的 env」重算会给出与当时不同的结论）。
+        if getattr(r, "thresholds", None):
+            mean, n = float(r.peer_mean), int(r.peer_count)
+        else:  # 老 JSON / 老缓存的兜底：没记录过判定依据，只能按当前阈值现算
+            mean, n = peer_yield(reports, r)
         rows.append(
             {
                 "chunk_id": r.chunk_id,
@@ -125,11 +129,12 @@ def low_yield_rows(extraction, tender=None) -> list[dict]:
                 "yield_rate": float(r.yield_rate),
                 "peer_mean": mean,
                 "peers": n,
+                "hit_abs": bool(getattr(r, "hit_abs", False)),
+                "hit_peer": bool(getattr(r, "hit_peer", False)),
                 "tasks": list(r.tasks),
                 "labels": [TASK_LABELS.get(t, t) for t in r.tasks],
                 # 判定依据要能复算：命中哪一条、跟谁比、比的是多少
-                "rule": f"低于绝对下限 {LOW_YIELD_ABS} 条/千字符" if over_abs
-                else f"低于同章其它块均值 {mean} 的 1/3（{n} 个兄弟块）",
+                "rule": low_yield_basis(r),
             }
         )
     return rows

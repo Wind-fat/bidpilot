@@ -65,9 +65,22 @@ def partial_banner(rows: list[dict]) -> str:
     )
 
 
-def low_yield_banner(rows: list[dict]) -> str:
-    """低产块横幅：每块给 chunk id、页码、抽到几条、产出率与同章均值——读者能自己判断该不该补看。
+def low_yield_why(row: dict) -> str:
+    """低产块的「判定依据」：命中哪条规则 + 同章对比基准（兄弟块均值与样本数）。
 
+    `pipeline.low_yield_rows` 已经把 `extract.low_yield_basis()` 的结论放进 `rule`，
+    这里只做兜底（手工构造的行/老数据没有 `rule` 时至少给出可比的基准）。
+    """
+    rule = str(row.get("rule") or "").strip()
+    if rule:
+        return rule
+    return f"命中规则：低于同章其它块均值；对比基准：同章其它块均值 {row.get('peer_mean', 0)} 条/千字符"
+
+
+def low_yield_banner(rows: list[dict]) -> str:
+    """低产块横幅：每块给 chunk id、页码、抽到几条、产出率、命中规则与同章基准。
+
+    给的不只是「少了」，而是「跟谁比少、命中哪条」——读者才判得出是误报还是真漏。
     与 `partial_banner` 的区别只在措辞与后果：那边是「这些页的内容不在文件里」，
     这边是「这些页可能少抽了，条目本身是合规的」。
     """
@@ -78,7 +91,8 @@ def low_yield_banner(rows: list[dict]) -> str:
         where = f"（{r['section_title']}）" if r.get("section_title") else ""
         parts.append(
             f"{r.get('chunk_id') or '-'}{where} {pages} 只抽到 {r.get('items', 0)} 条"
-            f"（{r.get('yield_rate', 0)} 条/千字符，同章其它块均值 {r.get('peer_mean', 0)}）"
+            f"（{r.get('yield_rate', 0)} 条/千字符，同章其它块均值 {r.get('peer_mean', 0)}；"
+            f"{low_yield_why(r)}）"
         )
     return BANNER_LOW_YIELD_HEAD + "；".join(parts) + "。"
 
@@ -219,8 +233,8 @@ def build_docx(
             where = f"（{r['section_title']}）" if r.get("section_title") else ""
             document.add_paragraph(
                 f"{r.get('chunk_id') or '-'}{where} {pages}：只抽到 {r.get('items', 0)} 条，"
-                f"{r.get('items', 0)} 条 / {r.get('body_chars', 0)} 字 = {r.get('yield_rate', 0)} 条/千字符"
-                f"（{r.get('rule') or '低于同章均值'}），同章其它块均值 {r.get('peer_mean', 0)}。"
+                f"{r.get('items', 0)} 条 / {r.get('body_chars', 0)} 字 = {r.get('yield_rate', 0)} 条/千字符。"
+                f"{low_yield_why(r)}。"
                 "这些条目本身通过了页码与原文校验，但条数明显偏低，请对照原文补看缺了哪些要求。"
             )
 
