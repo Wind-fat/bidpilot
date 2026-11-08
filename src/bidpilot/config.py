@@ -39,6 +39,15 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_thinking() -> bool | None:
+    """BIDPILOT_LLM_ENABLE_THINKING：未设置 → False（关思考，省钱省时）；
+    设为空串 / auto / unset → None（不下发该字段，留给上游默认）。"""
+    raw = os.getenv("BIDPILOT_LLM_ENABLE_THINKING")
+    if raw is not None and raw.strip().lower() in {"", "auto", "unset", "default"}:
+        return None
+    return _env_flag("BIDPILOT_LLM_ENABLE_THINKING", False)
+
+
 def _env_cache_dir() -> Path | None:
     """BIDPILOT_CACHE_DIR：未设置 → out/_cache；设为 0/none/off → 关闭缓存。"""
     raw = os.getenv("BIDPILOT_CACHE_DIR")
@@ -57,6 +66,12 @@ class Settings:
     llm_model: str = field(default_factory=lambda: os.getenv("BIDPILOT_LLM_MODEL", "qwen-cn/qwen3.8-flash"))
     llm_timeout_s: float = field(default_factory=lambda: _env_float("BIDPILOT_LLM_TIMEOUT_S", 180.0))
     llm_temperature: float = field(default_factory=lambda: _env_float("BIDPILOT_LLM_TEMPERATURE", 0.0))
+    # 推理模型的「思考」开关（DashScope qwen3 系支持请求体顶层 enable_thinking）。
+    # 默认 False：纯**成本/延迟**取舍 —— 实测同一抽取块关掉思考后 completion token 降到约 1/5.7、
+    # 单块耗时降到约 1/7；quote 可回查率不变，但密集技术块会少条目（p15-16 少 1 条），
+    # 所以抽取的重试会强制升级成开思考（extract.extract_chunk）。A/B 见 docs/REAL-PROVIDER.md。
+    # 设为空串 / auto 表示**不下发该字段**（上游不认这个参数会 400，这类供应商用 auto）。
+    llm_enable_thinking: bool | None = field(default_factory=_env_thinking)
     # 模板降级默认关闭：LLM 不可用时章节直接 failed，不产出"看起来能交"的模板句。
     allow_mock: bool = field(default_factory=lambda: _env_flag("BIDPILOT_ALLOW_MOCK", False))
 

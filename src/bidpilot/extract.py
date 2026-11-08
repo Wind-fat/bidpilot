@@ -109,6 +109,8 @@ class ChunkReport:
     tasks: list[str]
     attempts: int = 0
     ok: bool = False
+    # 重试时是否升级成「开思考」（见 extract_chunk）：空结果块靠它换回条目
+    escalated: bool = False
     errors: list[str] = field(default_factory=list)
     counts: dict[str, int] = field(default_factory=dict)
 
@@ -143,6 +145,7 @@ class ExtractResult:
             "tech_requirements": cnt(self.tech_requirements),
             "chunks": len(self.reports),
             "chunks_failed": failed,
+            "chunks_escalated": sum(1 for r in self.reports if r.escalated),
             "usage": self.usage,
         }
 
@@ -402,9 +405,16 @@ async def extract_chunk(llm: LLM, doc: TenderDoc, chunk: Chunk, max_retries: int
 
     for attempt in range(max_retries + 1):
         report.attempts = attempt + 1
+        # 重试升级：首轮按默认（默认关思考，省 token/延迟），重试一律开思考。
+        # 实测（docs/REAL-PROVIDER.md）：关思考时这份语料有 4/14 块连续三轮吐回空数组，
+        # 整块条目直接归零；开思考后同样的块能正常出条目 —— 用「只在重试时烧 token」换回召回。
+        escalate = attempt > 0
+        report.escalated = report.escalated or escalate
         t0 = time.perf_counter()
         try:
-            reply = await llm.complete(messages, json_mode=True, max_tokens=6000)
+            reply = await llm.complete(
+                messages, json_mode=True, max_tokens=6000, thinking=True if escalate else None
+            )
         except LLMError as exc:
             report.errors = [str(exc)]
             log.warning("chunk %s attempt %d LLM 失败 %.1fs: %s", chunk.id, attempt + 1, time.perf_counter() - t0, exc)
@@ -575,8 +585,9 @@ def relocate(doc: TenderDoc, res: ExtractResult) -> dict:
     return stats
 
 
-def _cache_file(cache_dir: Path, chunk: Chunk, model: str) -> Path:
-    key = hashlib.sha1(f"{model}|{chunk.id}|{','.join(chunk.tasks)}|{chunk.body}".encode()).hexdigest()[:16]
+def _cache_file(cache_dir: Path, chunk: Chunk, model: str, thinking: bool | None = None) -> Path:
+    # thinking 也进 key：开/关思考是两次不同的请求，混用缓存会让「关思考没掉条目」这种结论变成假的
+    key = hashlib.sha1(f"{model}|{thinking}|{chunk.id}|{','.join(chunk.tasks)}|{chunk.body}".encode()).hexdigest()[:16]
     return cache_dir / f"{key}.json"
 
 
@@ -589,8 +600,12 @@ async def extract(
     concurrency: int = 3,
     cache_dir: str | Path | None = None,
     model: str = "",
+    thinking: bool | None = None,
 ) -> ExtractResult:
-    """分块抽取。cache_dir 非空时逐块落盘：超时/中断后重跑直接命中已完成的块。"""
+    """分块抽取。cache_dir 非空时逐块落盘：超时/中断后重跑直接命中已完成的块。
+
+    thinking 只用于缓存分区（真正下不下发由 ChatClient/Settings 决定）。
+    """
     res = ExtractResult(title=doc.title, source=str(doc.path), source_sha256=file_sha256(doc.path))
     chunks = build_chunks(doc, max_chars=max_chars)
     cache = Path(cache_dir) if cache_dir else None
@@ -600,7 +615,7 @@ async def extract(
     log.info("抽取开始：%d 块 / 并发 %d / 缓存 %s", len(chunks), concurrency, cache or "关闭")
 
     async def one(chunk: Chunk):
-        path = _cache_file(cache, chunk, model) if cache is not None else None
+        path = _cache_file(cache, chunk, model, thinking) if cache is not None else None
         if path is not None and path.exists():
             try:
                 blob = json.loads(path.read_text(encoding="utf-8"))

@@ -74,7 +74,10 @@ def main() -> int:
     print(f"评分项      ：{ex['scoring_items']['total']:3d} 条，needs_review {ex['scoring_items']['needs_review']}")
     print(f"废标条款    ：{ex['disqualifications']['total']:3d} 条，needs_review {ex['disqualifications']['needs_review']}")
     print(f"技术要求    ：{ex['tech_requirements']['total']:3d} 条，needs_review {ex['tech_requirements']['needs_review']}")
-    print(f"抽取分块    ：{ex['chunks']} 块，重试后仍失败 {len(ex['chunks_failed'])} 块")
+    print(
+        f"抽取分块    ：{ex['chunks']} 块，重试后仍失败 {len(ex['chunks_failed'])} 块"
+        f"（其中 {ex.get('chunks_escalated', 0)} 块在重试时升级开思考）"
+    )
     for cid in ex["chunks_failed"]:
         print(f"    ! 未完全通过校验：{cid}")
     print("-" * 68)

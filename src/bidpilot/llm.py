@@ -38,7 +38,14 @@ class LLMReply:
 
 
 class LLM(Protocol):
-    async def complete(self, messages: list[dict], *, json_mode: bool = True, max_tokens: int | None = None) -> LLMReply: ...
+    async def complete(
+        self,
+        messages: list[dict],
+        *,
+        json_mode: bool = True,
+        max_tokens: int | None = None,
+        thinking: bool | None = None,
+    ) -> LLMReply: ...
 
 
 class ChatClient:
@@ -58,8 +65,19 @@ class ChatClient:
         return self._client
 
     async def complete(
-        self, messages: list[dict], *, json_mode: bool = True, max_tokens: int | None = None, temperature: float | None = None
+        self,
+        messages: list[dict],
+        *,
+        json_mode: bool = True,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        thinking: bool | None = None,
     ) -> LLMReply:
+        """thinking=None 用 Settings 里的默认值；显式传值则覆盖本次请求。
+
+        显式覆盖是给抽取重试用的：首轮按默认（关思考，省钱），重试时升级到开思考，
+        让「空结果 / quote 校验不过」的块用更多 token 换回条目，而不是整块丢掉。
+        """
         payload: dict = {
             "model": self.s.llm_model,
             "messages": messages,
@@ -67,6 +85,11 @@ class ChatClient:
         }
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
+        # 推理模型的思考开关：默认 False（见 config.Settings.llm_enable_thinking）。
+        # DashScope qwen3 系认这个顶层字段；上游不认时用 BIDPILOT_LLM_ENABLE_THINKING=auto 不下发。
+        think = self.s.llm_enable_thinking if thinking is None else thinking
+        if think is not None:
+            payload["enable_thinking"] = think
         if max_tokens:
             payload["max_tokens"] = max_tokens
         t0 = time.perf_counter()
@@ -106,9 +129,18 @@ class FakeLLM:
         self.responses = list(responses)
         self.repeat_last = repeat_last
         self.calls: list[list[dict]] = []
+        self.thinkings: list[bool | None] = []
 
-    async def complete(self, messages: list[dict], *, json_mode: bool = True, max_tokens: int | None = None) -> LLMReply:
+    async def complete(
+        self,
+        messages: list[dict],
+        *,
+        json_mode: bool = True,
+        max_tokens: int | None = None,
+        thinking: bool | None = None,
+    ) -> LLMReply:
         self.calls.append(messages)
+        self.thinkings.append(thinking)
         idx = min(len(self.calls) - 1, len(self.responses) - 1)
         text = self.responses[idx] if self.responses else "{}"
         return LLMReply(text=text, usage=Usage(model="fake", mocked=True))

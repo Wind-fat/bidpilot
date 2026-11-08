@@ -211,6 +211,7 @@ async def run_pipeline(
             concurrency=concurrency,
             cache_dir=s.cache_dir,
             model=s.llm_model,
+            thinking=s.llm_enable_thinking,
         )
     if extract_out:
         p = Path(extract_out)
