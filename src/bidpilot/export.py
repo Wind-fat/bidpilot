@@ -22,6 +22,43 @@ BANNER_EXAMPLE_CAPS = "当前能力库为示例数据（EXAMPLE DATA），需求
 BANNER_FAILED = "本文件不含任何通过校验的应答段落：生成阶段整节失败，交付物不完整，不得作为投标文件使用。"
 # 分阶段跑（--no-generate）：只有抽取+矩阵，没有应答正文，同样是空壳，必须自证
 BANNER_STAGED = "本文件只有抽取与能力矩阵结果：本次运行未生成应答正文（--no-generate），不能作为投标文件使用。"
+# 抽取阶段有块整块失败：文件里的应答少了几页的内容，必须点名「哪几块、缺什么」。
+# 这是条**动态**横幅（拼上失败块明细），所以只固定句首；README 退出码表钉的就是这个句首。
+BANNER_PARTIAL_HEAD = "本文件内容不完整（抽取阶段有块整块失败）："
+
+
+def chunk_shortfall(row: dict) -> str:
+    """一个失败块的「后果」短语：真没抽到 vs 抽到了但没通过校验——两种说法不能混。
+
+    `chunks_failed` 里同时住着两类块（extract_chunk 的 ok=False）：
+    - 一条都没抽到（空结果 / LLM 失败）→ 内容**确实不在**文件里，说「缺」；
+    - 抽到了但有条目 quote/page 校验不过 → 条目仍在（needs_review），只是需要人工复核。
+    把后者也说成「缺」就是另一形式的假绿（反过来夸大缺失）。
+    """
+    if int(row.get("extracted") or 0) == 0:
+        return f"缺{'、'.join(row.get('missing') or []) or '该页段条目'}"
+    return f"{int(row['extracted'])} 条已抽出但未通过校验（needs_review），需人工复核"
+
+
+def partial_banner(rows: list[dict]) -> str:
+    """把失败块明细拼成首页横幅：每块给 chunk id、页码范围、缺什么（或为什么不算数）。
+
+    只说「有 4 块失败」等于没说——读者要能定位到「p23-25 的技术要求没抽到」，
+    再把这几页原文补进交付物。
+    """
+    parts: list[str] = []
+    for r in rows:
+        start, end = r.get("page_start"), r.get("page_end")
+        pages = f"p{start}" if start == end else f"p{start}-{end}"
+        where = f"（{r['section_title']}）" if r.get("section_title") else ""
+        parts.append(
+            f"{r.get('chunk_id') or '-'}{where} {pages} 重试 {r.get('attempts', 0)} 次后仍失败，{chunk_shortfall(r)}"
+        )
+    return (
+        BANNER_PARTIAL_HEAD
+        + "；".join(parts)
+        + "。上述页段的内容不完整，不得直接作为投标文件使用。"
+    )
 
 
 def _set_cn_font(document: Document, name: str = "宋体") -> None:
@@ -78,8 +115,9 @@ def build_docx(
     example_capabilities: bool = False,
     failed: bool = False,
     staged: bool = False,
+    chunk_failures: list[dict] | None = None,
 ) -> Path:
-    """payload: {title, doc_id, sections: [{title, items, paragraphs:[{text, sources, kind}]}], failures?}
+    """payload: {title, doc_id, sections: [{title, items, paragraphs:[{text, sources, kind}]}], failures?, chunk_failures?}
 
     `mocked` / `example_capabilities` 为真时在首页插横幅：这两种情况下的文档内容
     不能当作投标交付物，必须让打开文件的人立刻知道。
@@ -87,16 +125,23 @@ def build_docx(
     `failed` 为真表示**整份交付物没有有效内容**（生成阶段整节失败）：此时首段就是
     废稿声明，正文里再列出失败章节——旧实现会落一份只有封面+目录的 35KB 文件，
     打开看结构完整，只有退出码能发现问题（ARCH-REVIEW P0-05 的延伸）。
+
+    `chunk_failures` 非空表示**抽取阶段有块整块失败**：那份内容根本没进来，
+    首段横幅必须点名「哪几块、缺哪几页的什么」，正文再逐块列明细（退出码 4 / `_PARTIAL`）。
     """
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     document = Document()
     _set_cn_font(document)
 
+    rows = chunk_failures if chunk_failures is not None else payload.get("chunk_failures") or []
     if failed:
         _add_banner(document, BANNER_FAILED, fill="FFC7CE")
-    elif staged:
-        _add_banner(document, BANNER_STAGED, fill="EDEDED")
+    else:
+        if rows:
+            _add_banner(document, partial_banner(rows), fill="FFC7CE")
+        if staged:
+            _add_banner(document, BANNER_STAGED, fill="EDEDED")
 
     title = document.add_paragraph()
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -125,6 +170,16 @@ def build_docx(
         for f in failures:
             document.add_paragraph(
                 f"{f.get('section_id') or '-'} / {f.get('title') or '-'}：{f.get('reason') or '未产出任何应答'}"
+            )
+
+    if rows:
+        document.add_heading("抽取不完整的页段（这些页的内容不在本文件中）", level=1)
+        for r in rows:
+            pages = f"p{r.get('page_start')}" if r.get("page_start") == r.get("page_end") else f"p{r.get('page_start')}-{r.get('page_end')}"
+            where = f"（{r['section_title']}）" if r.get("section_title") else ""
+            document.add_paragraph(
+                f"{r.get('chunk_id') or '-'}{where} {pages}：重试 {r.get('attempts', 0)} 次后仍失败，"
+                f"{chunk_shortfall(r)}；原因：{r.get('reason') or '未通过校验'}"
             )
 
     item_by_id = {}

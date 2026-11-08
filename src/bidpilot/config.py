@@ -64,7 +64,11 @@ class Settings:
     llm_base_url: str = field(default_factory=lambda: os.getenv("BIDPILOT_LLM_BASE_URL", "http://127.0.0.1:3425/v1"))
     llm_api_key: str = field(default_factory=lambda: os.getenv("BIDPILOT_LLM_API_KEY", "magpie"))
     llm_model: str = field(default_factory=lambda: os.getenv("BIDPILOT_LLM_MODEL", "qwen-cn/qwen3.8-flash"))
-    llm_timeout_s: float = field(default_factory=lambda: _env_float("BIDPILOT_LLM_TIMEOUT_S", 180.0))
+    # 300 而不是 180：抽取重试会**升级成开思考**（extract.extract_chunk），单块实测 110-170s；
+    # 180s 时真实语料里出现过一次 ReadTimeout，而同一次请求 98.9s 就返回了——
+    # 也就是说 180 卡掉的是「慢但会成功」的请求，白丢一块内容。300s 的代价只是失败块多等 2 分钟。
+    # 已知更短的供应商/模型可用 BIDPILOT_LLM_TIMEOUT_S 覆盖（见 README「配置」）。
+    llm_timeout_s: float = field(default_factory=lambda: _env_float("BIDPILOT_LLM_TIMEOUT_S", 300.0))
     llm_temperature: float = field(default_factory=lambda: _env_float("BIDPILOT_LLM_TEMPERATURE", 0.0))
     # 推理模型的「思考」开关（DashScope qwen3 系支持请求体顶层 enable_thinking）。
     # 默认 False：纯**成本/延迟**取舍 —— 实测同一抽取块关掉思考后 completion token 降到约 1/5.7、

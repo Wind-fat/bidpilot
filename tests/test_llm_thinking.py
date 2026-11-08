@@ -112,3 +112,11 @@ def test_retry_escalates_to_thinking_when_first_attempt_is_empty(synthetic_doc):
     assert fake.thinkings[0] is None  # 首轮不覆盖默认
     assert fake.thinkings[1] is True  # 重试升级
     assert report.escalated is True
+
+
+def test_llm_timeout_default_is_300s_and_overridable(monkeypatch):
+    """默认 300s：抽取重试升级成「开思考」后单块 110-170s，180s 会卡掉本可成功的请求（实测 98.9s 返回）。"""
+    monkeypatch.delenv("BIDPILOT_LLM_TIMEOUT_S", raising=False)
+    assert Settings().llm_timeout_s == 300.0
+    monkeypatch.setenv("BIDPILOT_LLM_TIMEOUT_S", "120")
+    assert Settings().llm_timeout_s == 120.0

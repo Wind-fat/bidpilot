@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from bidpilot.config import get_settings  # noqa: E402
+from bidpilot.export import chunk_shortfall  # noqa: E402
 from bidpilot.pipeline import EXIT_UNREADABLE, format_degradation_report, run_pipeline  # noqa: E402
 from bidpilot.sections import TenderParseError  # noqa: E402
 
@@ -74,12 +75,20 @@ def main() -> int:
     print(f"评分项      ：{ex['scoring_items']['total']:3d} 条，needs_review {ex['scoring_items']['needs_review']}")
     print(f"废标条款    ：{ex['disqualifications']['total']:3d} 条，needs_review {ex['disqualifications']['needs_review']}")
     print(f"技术要求    ：{ex['tech_requirements']['total']:3d} 条，needs_review {ex['tech_requirements']['needs_review']}")
+    chunk_rows = res.chunk_failures()
     print(
         f"抽取分块    ：{ex['chunks']} 块，重试后仍失败 {len(ex['chunks_failed'])} 块"
         f"（其中 {ex.get('chunks_escalated', 0)} 块在重试时升级开思考）"
     )
-    for cid in ex["chunks_failed"]:
-        print(f"    ! 未完全通过校验：{cid}")
+    for row in chunk_rows:
+        pages = f"p{row['page_start']}" if row["page_start"] == row["page_end"] else f"p{row['page_start']}-{row['page_end']}"
+        where = f"（{row['section_title']}）" if row["section_title"] else ""
+        print(
+            f"    ! 整块失败：{row['chunk_id']}{where} {pages}"
+            f" → {chunk_shortfall(row)}（重试 {row['attempts']} 次：{row['reason']}）"
+        )
+    if chunk_rows:
+        print(f"    交付物标记：文件名后缀 {res.suffix}，退出码 {res.exit_code}（抽取内容不完整）")
     print("-" * 68)
     m = stats["capability_matrix"]
     print(f"需求-能力矩阵：共 {m['total']} 条  满足 {m.get('满足', 0)} / 部分满足 {m.get('部分满足', 0)} / 不满足 {m.get('不满足', 0)}")

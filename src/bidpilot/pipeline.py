@@ -16,7 +16,7 @@ from pathlib import Path
 from .capabilities import CapabilityIndex, RequirementMatch, build_matrix, load_capabilities
 from .config import Settings, get_settings
 from .db import SqliteStore, init_db, make_engine, save_document, save_generation
-from .export import BANNER_EXAMPLE_CAPS, build_docx
+from .export import BANNER_EXAMPLE_CAPS, build_docx, chunk_shortfall
 from .extract import ExtractResult, dump_extract, extract, load_extract, relocate
 from .llm import LLM, ChatClient
 from .sections import TenderDoc, load_tender
@@ -39,6 +39,51 @@ log = logging.getLogger("bidpilot.pipeline")
 
 MOCK_SUFFIX = "_MOCK"
 FAILED_SUFFIX = "_FAILED"
+# 抽取块失败但仍有内容：`_PARTIAL` = 「内容不完整」的另一副面孔（整份废稿才是 `_FAILED`）。
+# 两个后缀都归退出码 4，见 SUFFIX_SEVERITY。
+PARTIAL_SUFFIX = "_PARTIAL"
+
+# 后缀 → 严重度：文件名、退出码、首页横幅必须由**同一批** severity 判定，否则四处留痕会互相拆台。
+SUFFIX_SEVERITY = {FAILED_SUFFIX: "empty_delivery", PARTIAL_SUFFIX: "incomplete", MOCK_SUFFIX: "mocked"}
+
+# 抽取任务 → 中文名：横幅/CLI 要说清「因此缺了哪部分内容」，不能只报一个块号。
+TASK_LABELS = {
+    "scoring_items": "评分项",
+    "disqualifications": "废标条款",
+    "tech_requirements": "技术要求",
+}
+
+
+def chunk_failure_rows(extraction, tender=None) -> list[dict]:
+    """逐块失败的明细（`problems()` / docx 横幅 / CLI 清单共用这一份，不各写一套）。
+
+    条目带页码、所属章节、缺失的条目类型与最后一次错误：读者要能据此判断「缺了哪几页的什么」，
+    而不是只知道「有 4 块失败」。
+    """
+    if extraction is None:
+        return []
+    sections = {s.id: s.title for s in getattr(tender, "sections", None) or []}
+    rows: list[dict] = []
+    for r in getattr(extraction, "reports", None) or []:
+        if getattr(r, "ok", True):
+            continue
+        pages = getattr(r, "pages", (0, 0))
+        tasks = list(getattr(r, "tasks", None) or [])
+        chunk_id = r.chunk_id
+        rows.append(
+            {
+                "chunk_id": chunk_id,
+                "page_start": int(pages[0]),
+                "page_end": int(pages[1]),
+                "section_title": sections.get(chunk_id.split("#", 1)[0], ""),
+                "tasks": tasks,
+                "missing": [TASK_LABELS.get(t, t) for t in tasks],
+                "attempts": int(getattr(r, "attempts", 0) or 0),
+                "extracted": sum(int(v or 0) for v in (getattr(r, "counts", None) or {}).values()),
+                "reason": "；".join((getattr(r, "errors", None) or [])[:2]) or "重试后仍未通过校验",
+            }
+        )
+    return rows
 
 
 def exit_code_for(severities) -> int:
@@ -53,14 +98,18 @@ def exit_code_for(severities) -> int:
     return EXIT_OK
 
 
-def artifact_suffix(*, empty_delivery: bool, mocked: bool) -> str:
-    """文件名后缀：一个名字只能表达一种污染，取最严重者 —— `_FAILED` > `_MOCK`。
+def artifact_suffix(*, empty_delivery: bool, mocked: bool, partial: bool = False) -> str:
+    """文件名后缀：一个名字只能表达一种污染，取最严重者 —— `_FAILED` > `_PARTIAL` > `_MOCK`。
 
-    横幅可以两张同时出现（失败声明在前、模板横幅在后），但退出码与文件名必须与
-    横幅里的**最严重那条**指向同一个值，否则「三处留痕」会互相拆台。
+    `_PARTIAL` 专指「抽取阶段有块整块失败、交付物少了那几页的内容」（退出码同 `_FAILED` 都是 4：
+    两者都是「内容不完整」，区别只在「全无」还是「少一块」）。横幅可以多张同时出现
+    （失败声明在前、模板横幅在后），但退出码与文件名必须与横幅里的**最严重那条**指向同一个值，
+    否则「四处留痕」会互相拆台。
     """
     if empty_delivery:
         return FAILED_SUFFIX
+    if partial:
+        return PARTIAL_SUFFIX
     return MOCK_SUFFIX if mocked else ""
 
 
@@ -82,9 +131,28 @@ class PipelineResult:
     timing: dict = field(default_factory=dict)
     llm_usage: dict = field(default_factory=dict)
 
+    def chunk_failures(self) -> list[dict]:
+        """抽取阶段整块失败的页段（problems / 横幅 / 文件名 / CLI 共用的唯一明细）。"""
+        return chunk_failure_rows(self.extraction, self.tender)
+
     def problems(self) -> list[dict]:
-        """交付物污染清单的汇总视图：workflow 的三个级别 + 空交付物 + 示例能力库。"""
+        """交付物污染清单：workflow 的三个级别 + 抽取块失败 + 空交付物 + 示例能力库。"""
         out = list(self.workflow.problems())
+        for row in self.chunk_failures():
+            where = f"（{row['section_title']}）" if row["section_title"] else ""
+            out.append(
+                {
+                    "section_id": row["chunk_id"],
+                    "title": f"抽取块 p{row['page_start']}-{row['page_end']}{where}",
+                    "severity": "incomplete",
+                    "reason": (
+                        f"重试 {row['attempts']} 次后仍失败（{row['reason']}）：{chunk_shortfall(row)}"
+                        + ("，交付物缺少这部分内容" if row["extracted"] == 0 else "")
+                    ),
+                    "pages": [row["page_start"], row["page_end"]],
+                    "missing": row["missing"],
+                }
+            )
         if self.empty_delivery:
             out.append(
                 {
@@ -112,8 +180,12 @@ class PipelineResult:
 
     @property
     def suffix(self) -> str:
-        """落盘文件名后缀，与 exit_code 同源（`_FAILED` > `_MOCK` > 空）。"""
-        return artifact_suffix(empty_delivery=self.empty_delivery, mocked=self.workflow.mocked)
+        """落盘文件名后缀，与 exit_code 同源（`_FAILED` > `_PARTIAL` > `_MOCK` > 空）。"""
+        return artifact_suffix(
+            empty_delivery=self.empty_delivery,
+            mocked=self.workflow.mocked,
+            partial=bool(self.chunk_failures()),
+        )
 
     def stats(self) -> dict:
         return {
@@ -130,6 +202,7 @@ class PipelineResult:
                 "exit_code": self.exit_code,
                 "mock_allowed": self.allow_mock,
                 "empty_delivery": self.empty_delivery,
+                "chunk_failures": self.chunk_failures(),
             },
             "docx": {"path": str(self.docx_path), "bytes": self.docx_bytes},
             "capability_library_note": self.capability_meta,
@@ -218,6 +291,10 @@ async def run_pipeline(
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps(dump_extract(extraction), ensure_ascii=False, indent=2), encoding="utf-8")
     extract_s = round(time.perf_counter() - t_extract0, 1)
+    # 整块失败的页段：problems / 文件名 / 首页横幅 / CLI 清单都从这一份明细出发（四处同源）
+    chunk_rows = chunk_failure_rows(extraction, tender)
+    if chunk_rows:
+        log.warning("抽取有 %d 块整块失败（交付物不完整，退出码 4）：%s", len(chunk_rows), [r["chunk_id"] for r in chunk_rows])
     # 抽取阶段真正发生的调用数（缓存命中时为 0，重试会多算）
     calls_after_extract = len(client.usage_log) if isinstance(client, ChatClient) else 0
     tok_after_extract = (
@@ -263,9 +340,12 @@ async def run_pipeline(
     # 两者同时成立时文件名只留最严重的一个（_FAILED），退出码同源是 4，横幅两张都在。
     sections_out = aggregated.get("sections") or []
     empty_delivery = bool(generate) and not sections_out
-    suffix = artifact_suffix(empty_delivery=empty_delivery, mocked=workflow.mocked)
+    suffix = artifact_suffix(
+        empty_delivery=empty_delivery, mocked=workflow.mocked, partial=bool(chunk_rows)
+    )
     docx_path = out / f"{Path(pdf_path).stem}_技术应答初稿{suffix}.docx"
     payload = dict(aggregated)
+    payload["chunk_failures"] = chunk_rows
     if empty_delivery:
         payload["failures"] = [p for p in workflow.problems() if p["severity"] in ("failed", "incomplete")]
     build_docx(
@@ -275,6 +355,7 @@ async def run_pipeline(
         example_capabilities=caps_lib.is_example,
         failed=empty_delivery,
         staged=not generate,
+        chunk_failures=chunk_rows,
     )
 
     if engine is not None:

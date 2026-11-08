@@ -91,9 +91,11 @@ chunk technical-p13-98d1227c#p23-25 attempt 3 返回 3066 字 / 98.9s
 chunk technical-p13-98d1227c#p23-25 完成 ok=True attempts=3 279.5s counts={'tech_requirements': 18}
 ```
 
-默认 `BIDPILOT_LLM_TIMEOUT_S=180` 对推理模型的升级请求偏紧（实测单块最长 170 s，抖动一下就越线）。
-本轮**没有**改默认值（避免把「跑通」建立在调参上），只把超时当已知风险记下来：
-生产跑建议 `BIDPILOT_LLM_TIMEOUT_S=300`，代价是单块失败要多等 2 分钟才进下一次重试。
+默认 `BIDPILOT_LLM_TIMEOUT_S` 对推理模型的升级请求偏紧（实测单块最长 170 s，抖动一下就越线）。
+那次实测之后**已把默认值从 180 提到 300**（`config.Settings.llm_timeout_s`）：180 卡掉的那一次，
+同一请求 98.9 s 就返回了——超时比失败更糟，它丢的是一块本可成功的内容。
+代价是失败块要多等 2 分钟才进下一次重试；要覆盖就设环境变量，例如 `BIDPILOT_LLM_TIMEOUT_S=120`
+（更短的超时 = 更快失败、更容易丢块）。`tests/test_llm_thinking.py` 钉住默认值与覆盖行为。
 
 ## 真问题三：缓存 key 必须带 thinking 标记（已修）
 
