@@ -63,11 +63,10 @@ jobs:
           DOCUMIND_TOKEN: ${{ secrets.DOCUMIND_TOKEN }}
         run: |
           if [ -z "$DOCUMIND_TOKEN" ]; then
-            echo "::error title=缺少 DOCUMIND_TOKEN::documind 是私有仓，actions' 自带的 GITHUB_TOKEN 只能读本仓，无法 checkout 它。"
+            echo "::warning title=没有 DOCUMIND_TOKEN（documind 已 public，可忽略）::documind 现已 public，本步骤只是提示：如果你又把它改回私有，需要配 DOCUMIND_TOKEN。"
             echo "修法（约 2 分钟）：GitHub → Wind-fat/documind → Settings → Developer settings → 新建 fine-grained token（Contents: Read）→"
             echo "  回到 bidpilot 仓 → Settings → Secrets and variables → Actions → New repository secret → 名字 DOCUMIND_TOKEN。"
             echo "或者：把 documind 设为 public（本工作流自动用 github.token 即可，无需任何 secret）。"
-            exit 1
           fi
 
       - name: Checkout documind（../documind，path 依赖的目标）
@@ -113,11 +112,10 @@ jobs:
           DOCUMIND_TOKEN: ${{ secrets.DOCUMIND_TOKEN }}
         run: |
           if [ -z "$DOCUMIND_TOKEN" ]; then
-            echo "::error title=缺少 DOCUMIND_TOKEN::documind 是私有仓，GITHUB_TOKEN 只能读本仓，uv sync 的 path 依赖会失败。"
+            echo "::warning title=没有 DOCUMIND_TOKEN（documind 已 public，可忽略）::同样的提示：documind 现已 public；若改回私有，需配 DOCUMIND_TOKEN，否则 uv sync 会失败。"
             echo "修法：Wind-fat/documind → Settings → Developer settings → fine-grained token（Contents: Read）→"
             echo "      bidpilot → Settings → Secrets and variables → Actions → New repository secret → DOCUMIND_TOKEN。"
             echo "或者：把 documind 设为 public（工作流转用 github.token，无需任何 secret）。"
-            exit 1
           fi
 
       - name: Checkout documind（../documind）
@@ -160,11 +158,10 @@ jobs:
           DOCUMIND_TOKEN: ${{ secrets.DOCUMIND_TOKEN }}
         run: |
           if [ -z "$DOCUMIND_TOKEN" ]; then
-            echo "::error title=缺少 DOCUMIND_TOKEN::documind 是私有仓，GITHUB_TOKEN 只能读本仓，uv sync 的 path 依赖会失败。"
+            echo "::warning title=没有 DOCUMIND_TOKEN（documind 已 public，可忽略）::同样的提示：documind 现已 public；若改回私有，需配 DOCUMIND_TOKEN，否则 uv sync 会失败。"
             echo "修法：Wind-fat/documind → Settings → Developer settings → fine-grained token（Contents: Read）→"
             echo "      bidpilot → Settings → Secrets and variables → Actions → New repository secret → DOCUMIND_TOKEN。"
             echo "或者：把 documind 设为 public（工作流转用 github.token，无需任何 secret）。"
-            exit 1
           fi
 
       - name: Checkout documind（../documind）
