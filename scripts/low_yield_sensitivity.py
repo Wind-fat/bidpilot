@@ -212,14 +212,24 @@ def _defaults() -> dict:
 
 
 def main() -> int:
+    # Windows 控制台默认 cp1252/cp936，中文直接 print 会 UnicodeEncodeError（CI 上真撞过）。
+    # 输出编码不该决定脚本成败：能改就改，改不了就让它用 backslashreplace 兜住。
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")  # type: ignore[attr-defined]
+        except (AttributeError, ValueError):  # pragma: no cover - 老 Python / 被重定向
+            pass
+
     ap = argparse.ArgumentParser(description="低产阈值敏感性回归（零 LLM）")
     ap.add_argument("--json", type=Path, default=None, help="把结果写成 JSON（供 drift/回归测试读）")
     args = ap.parse_args()
 
     suites: dict[str, dict] = {}
+    skipped: list[str] = []
     for name, reports in (("synthetic", synthetic_reports()), ("real", real_reports())):
         if reports is None:
             print(f"（跳过真实语料：缺少 {REAL_JSON} 或 {PDF}）")
+            skipped.append(name)
             continue
         suite = run_suite(reports, CASES[name])
         suite["thresholds"] = _defaults()
@@ -236,20 +246,23 @@ def main() -> int:
     # 另一个方向没有翻转对象，这是数据事实，不是失效）。
     syn = suites["synthetic"]["cases"]
     real = suites.get("real", {"cases": []})["cases"]
-    ok = all(c["changed"] for c in syn) and all(
-        any(c["changed"] for c in real if c["env"] == env) for env in LOW_YIELD_ENV.values()
+    # 真实语料缺席（CI 上 out/ 是 gitignore 的）不是"旋钮失效"：只跑构造块的 8/8。
+    ok = all(c["changed"] for c in syn) and (
+        not real
+        or all(any(c["changed"] for c in real if c["env"] == env) for env in LOW_YIELD_ENV.values())
     )
     print(f"\n构造块：{sum(c['changed'] for c in syn)}/{len(syn)} 个方向改变了判定")
     if real:
         print(f"真实语料：{sum(c['changed'] for c in real)}/{len(real)} 个方向改变；"
               f"四个变量各自至少一个方向生效 → "
               f"{ {env: any(c['changed'] for c in real if c['env'] == env) for env in LOW_YIELD_ENV.values()} }")
-    print(f"结论：{'阈值可配且真的会改判' if ok else '**有旋钮无效**'}")
+    print(f"结论：{'阈值可配且真的会改判' if ok else '**有旋钮无效**'}"
+          + (f"（跳过：{', '.join(skipped)}）" if skipped else ""))
 
     if args.json:
         args.json.parent.mkdir(parents=True, exist_ok=True)
         args.json.write_text(
-            json.dumps({"ok": ok, "defaults": _defaults(), **suites},
+            json.dumps({"ok": ok, "defaults": _defaults(), "skipped": skipped, **suites},
                        ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
