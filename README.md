@@ -313,7 +313,7 @@ completion 这一栏**包含思维链 token**，别按「正文长度」估。
   实际墙钟 18.8–19.6 s（预算 1200 s 的 1.29%–1.63%）。**切章/分块没有因真 PDF 退化**；
   上一轮 Markdown 口径低估的是**块数**（人造 4000 字/页让块突破 2000 字上限，同样字数真 PDF 要多 2.3 倍块）。
   仍有限定：条款正文是同一份 41 页语料的池子循环（页数/章节真实、内容重复），**生成阶段（LLM）未测**。
-- **CI 三条红线（pytest / ruff / 引用可回查）已写进 `.github/workflows/ci.yml`，但当前 GitHub 上是红的**：
-  documind 是私有仓，actions 自带的 `GITHUB_TOKEN` 读不到它（`uv sync` 的 path 依赖需要兄弟目录）。
-  工作流已给出两条修法（配 `DOCUMIND_TOKEN` fine-grained token，或把 documind 设为 public）；
-  本地等价命令全绿，绿灯需要这个凭据决策。
+- **CI 三条红线（pytest / ruff / 引用可回查）已在 GitHub 上真跑通过**（`43197778495`）：
+  `ruff` 13s、`引用可回查（红线）` 14s、`pytest` 四条腿（ubuntu/windows × py3.12/3.13）37–59s 全绿。
+  documind 已转 public，workflow 用 `github.token` 直接 checkout 兄弟仓；若改回私有，需配 `DOCUMIND_TOKEN`。
+  首次真跑抓出两个本地看不到的问题（缺 `out/` 夹具时脚本 `return 1`、Windows cp1252 中文编码），均已修。
